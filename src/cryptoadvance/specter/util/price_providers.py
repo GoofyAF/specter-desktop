@@ -1,9 +1,12 @@
-import requests
 import logging
-from ..specter_error import SpecterError, handle_exception
-from urllib3.exceptions import NewConnectionError
-from requests.exceptions import ConnectionError
 from json.decoder import JSONDecodeError
+
+import requests
+from requests.exceptions import ConnectionError, HTTPError
+from urllib3.exceptions import NewConnectionError
+
+from ..specter_error import SpecterError, handle_exception
+from ..util.requests_tools import failsafe_request_get
 
 logger = logging.getLogger(__name__)
 
@@ -12,85 +15,64 @@ OZ_TO_G = 28.3495231
 currency_mapping = {
     "usd": {
         "symbol": "$",
-        "support": [
-            "bitstamp",
-            "coindesk",
-            "spotbit_coinbase",
-            "spotbit_kraken",
-            "spotbit_bitfinex",
-            "spotbit_okcoin",
-            "spotbit_bitstamp",
-        ],
+        "support": ["bitstamp", "coindesk", "spotbit_bitstamp", "spotbit_gemini"],
     },
     "eur": {
         "symbol": "€",
         "support": [
             "bitstamp",
             "coindesk",
-            "spotbit_coinbase",
-            "spotbit_kraken",
-            "spotbit_bitfinex",
-            "spotbit_okcoin_eur",
             "spotbit_bitstamp",
+            "spotbit_gemini",
         ],
     },
     "gbp": {
         "symbol": "£",
-        "support": [
-            "bitstamp",
-            "coindesk",
-            "spotbit_coinbase",
-            "spotbit_kraken",
-            "spotbit_bitfinex",
-            "spotbit_bitstamp",
-        ],
+        "support": ["bitstamp", "coindesk", "spotbit_bitstamp", "spotbit_gemini"],
     },
     "chf": {
         "symbol": " Fr.",
-        "support": ["coindesk", "spotbit_coinbase", "spotbit_kraken"],
+        "support": ["coindesk"],
     },
     "aud": {
         "symbol": "$",
-        "support": ["coindesk", "spotbit_coinbase", "spotbit_kraken"],
+        "support": ["coindesk"],
     },
     "cad": {
         "symbol": "$",
-        "support": ["coindesk", "spotbit_coinbase", "spotbit_kraken"],
+        "support": ["coindesk"],
     },
-    "nzd": {"symbol": "$", "support": ["coindesk", "spotbit_coinbase"]},
-    "hkd": {"symbol": "$", "support": ["coindesk", "spotbit_coinbase"]},
+    "nzd": {"symbol": "$", "support": ["coindesk"]},
+    "hkd": {"symbol": "$", "support": ["coindesk"]},
     "jpy": {
         "symbol": "¥",
         "support": [
             "coindesk",
-            "spotbit_coinbase",
-            "spotbit_kraken",
-            "spotbit_bitfinex",
         ],
     },
-    "rub": {"symbol": "₽", "support": ["coindesk", "spotbit_coinbase"]},
-    "ils": {"symbol": "₪", "support": ["coindesk", "spotbit_coinbase"]},
-    "jod": {"symbol": "د.ا", "support": ["coindesk", "spotbit_coinbase"]},
-    "twd": {"symbol": "$", "support": ["coindesk", "spotbit_coinbase"]},
-    "brl": {"symbol": " BRL", "support": ["coindesk", "spotbit_coinbase"]},
+    "rub": {"symbol": "₽", "support": ["coindesk"]},
+    "ils": {"symbol": "₪", "support": ["coindesk"]},
+    "jod": {"symbol": "د.ا", "support": ["coindesk"]},
+    "twd": {"symbol": "$", "support": ["coindesk"]},
+    "brl": {"symbol": " BRL", "support": ["coindesk"]},
     "xau": {
         "symbol": " oz. ",
-        "support": ["coindesk", "spotbit_coinbase"],
+        "support": ["coindesk"],
         "weight_unit_convertible": True,
     },
     "xag": {
         "symbol": " oz. ",
-        "support": ["coindesk", "spotbit_coinbase"],
+        "support": ["coindesk"],
         "weight_unit_convertible": True,
     },
     "xpt": {
         "symbol": " oz. ",
-        "support": ["spotbit_coinbase"],
+        "support": [],
         "weight_unit_convertible": True,
     },
     "xpd": {
         "symbol": " oz. ",
-        "support": ["spotbit_coinbase"],
+        "support": [],
         "weight_unit_convertible": True,
     },
 }
@@ -98,10 +80,13 @@ currency_mapping = {
 
 def update_price(specter, current_user):
     try:
-        price, symbol = get_price_at(specter, current_user, timestamp="now")
+        price, symbol = get_price_at(specter, timestamp="now")
         specter.update_alt_rate(price, current_user)
         specter.update_alt_symbol(symbol, current_user)
         return True
+    except SpecterError as e:
+        handle_exception(e)
+        logger.error(f"{e} while updating price")
     except Exception as e:
         handle_exception(e)
         return False
@@ -116,9 +101,11 @@ def update_price(specter, current_user):
 # (provider, currency) = specter.price_provider.split()
 
 
-def get_price_at(specter, current_user, timestamp="now"):
+def get_price_at(specter, timestamp="now"):
+    """returns a price and a currency-symbol at the timestamp"""
     try:
         if specter.price_check:
+
             requests_session = specter.requests_session(
                 force_tor=("spotbit" in specter.price_provider)
             )
@@ -131,7 +118,6 @@ def get_price_at(specter, current_user, timestamp="now"):
                 )
             except AttributeError:
                 raise SpecterError(f"Currency not supported: {currency}")
-
             if exchange not in currency_mapping[currency]["support"]:
                 raise SpecterError(
                     f"The currency {currency} is not supported on exchange {exchange}"
@@ -159,17 +145,21 @@ def get_price_at(specter, current_user, timestamp="now"):
                     raise SpecterError("coindesk does not support historic prices")
             elif specter.price_provider.startswith("spotbit"):
                 exchange = specter.price_provider.split("spotbit_")[1].split("_")[0]
+
                 if timestamp == "now":
+
                     price = failsafe_request_get(
                         requests_session,
-                        "http://h6zwwkcivy2hjys6xpinlnz2f74dsmvltzsd4xb42vinhlcaoe7fdeqd.onion/now/{}/{}".format(
-                            currency, exchange
+                        "http://r5sru63gzyrnaayaua2ydo32f4hf6vd33bq6qmtktx3wjoib2cwi2gqd.onion/api/now/{}/{}".format(
+                            currency.upper(), exchange
                         ),
                     )["close"]
                 else:
                     price = failsafe_request_get(
                         requests_session,
-                        "http://h6zwwkcivy2hjys6xpinlnz2f74dsmvltzsd4xb42vinhlcaoe7fdeqd.onion/hist/{}/{}/{}/{}".format(
+                        # TODO: Fix to use `start` and `end` query date time parameters instead of path parameters
+                        # Hope that works like this:
+                        "http://r5sru63gzyrnaayaua2ydo32f4hf6vd33bq6qmtktx3wjoib2cwi2gqd.onion/api/history/{}/{}?start={}&end={}".format(
                             currency,
                             exchange,
                             timestamp * 1000,
@@ -183,43 +173,23 @@ def get_price_at(specter, current_user, timestamp="now"):
                 elif specter.weight_unit == "kg":
                     price = price * OZ_TO_G / 1000
                     currency_symbol = " kg"
-
             return (price, currency_symbol)
+        raise Exception("get_price_at called whereas specter.price_check is False")
     except SpecterError as se:
         raise se
-    except (ConnectionRefusedError, ConnectionError, NewConnectionError) as e:
-        logger.error(e)
-        raise SpecterError(f"There are connection issue with the exchange:{e}")
     except KeyError as ke:
         raise SpecterError(f"Error as json doesn't look reasonable: {ke}")
-    except Exception as e:
-        handle_exception(e)
-        raise SpecterError(e)
 
 
 def _parse_exchange_currency(exchange_currency):
     # e.g. "spotbit_bitstamp_eur" or "bitstamp_eur"
     arr = exchange_currency.split("_")
     if len(arr) == 2:
+        if not arr[1] in currency_mapping.keys():
+            raise SpecterError(
+                f"{arr[1]} is not a valid currency. Received: {exchange_currency}"
+            )
         return arr[0], arr[1]
     elif len(arr) == 3:
         return f"{arr[0]}_{arr[1]}", arr[2]
     raise SpecterError(f"Cannot parse exchange_currency: {exchange_currency}")
-
-
-def failsafe_request_get(requests_session, url):
-    response: requests.Response = requests_session.get(url)
-    try:
-        json_response = response.json()
-        if json_response.get("errors"):
-            raise SpecterError(f"JSON error: {json_response}")
-        print(json_response)
-        return response.json()
-    except JSONDecodeError:
-        if response.status_code == 404:
-            raise SpecterError(
-                f"The currency_pair does not seem to exist for that provider (404)"
-            )
-    except Exception as e:
-        handle_exception(e)
-        raise SpecterError(e)

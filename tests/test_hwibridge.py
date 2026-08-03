@@ -1,13 +1,17 @@
 import json, requests
-from cryptoadvance.specter.devices import DeviceTypes
+from cryptoadvance.specter.devices.ledger import Ledger
+from cryptoadvance.specter.devices.trezor import Trezor
 
 
 def test_malformed_parse_error(client):
     client.environ_base["HTTP_ORIGIN"] = "http://127.0.0.1:25441/"
-    req = client.post("http://127.0.0.1:25441/hwi/api/", data=b"malformed")
+    req = client.post("http://127.0.0.1:25441/hwi/api/", data=b"{'muh':'meh'}")
     assert {
         "jsonrpc": "2.0",
-        "error": {"code": -32700, "message": "Parse error"},
+        "error": {
+            "code": -32700,
+            "message": "Parse error:Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+        },
         "id": None,
     } == json.loads(req.data)
 
@@ -111,14 +115,15 @@ def test_calling_method_with_non_existing_parameters(client):
             "forwarded_request": True,
         },
     )
-    assert {
-        "jsonrpc": "2.0",
-        "error": {
-            "code": -32000,
-            "message": "Internal error: enumerate() got an unexpected keyword argument 'non_existing_parameter'.",
-        },
-        "id": 1,
-    } == json.loads(req.data)
+
+    resp = json.loads(req.data)
+    assert resp["error"]["code"] == -32000
+    assert resp["error"]["message"].startswith("Internal error:")
+    assert resp["error"]["message"].endswith(
+        "got an unexpected keyword argument 'non_existing_parameter'."
+    )
+    assert resp["id"] == 1
+    assert resp["jsonrpc"] == "2.0"
 
 
 def test_call_not_connected_device(client):
@@ -130,7 +135,7 @@ def test_call_not_connected_device(client):
             "method": "prompt_pin",
             "id": 1,
             "params": {
-                "device_type": DeviceTypes.TREZOR,
+                "device_type": Trezor.device_type,
                 "path": "",
                 "passphrase": "",
                 "chain": "test",
@@ -157,7 +162,7 @@ def test_call_prompt_pin_invalid_device(client):
             "method": "prompt_pin",
             "id": 1,
             "params": {
-                "device_type": DeviceTypes.LEDGER,
+                "device_type": Ledger.device_type,
                 "path": "",
                 "passphrase": "",
                 "chain": "test",

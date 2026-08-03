@@ -1,82 +1,132 @@
-describe('Send transactions from wallets', () => {
-    it('Freeze and unfreeze UTXO', () => {
-        const name = "UTXO Hot Bitcoin3"
-        const wallet_name = name+" wallet"
-        var wallet_name_ref = wallet_name.toLowerCase().replace(/ /g,"_")
-        cy.viewport(1200,660)
+// This test just needs a Bitcoin Core connection
+describe('Test the actions in UTXO list', () => {
+    
+    before(() => {
         cy.visit('/')
-        cy.addHotDevice(name+" device","bitcoin")
-        cy.addHotWallet(wallet_name,name+" device", "bitcoin", "segwit")
-        cy.get('#fullbalance_amount').then(($div) => {
-            const balance = parseFloat($div.text())
-            if ( balance <= 20) {
-                cy.log("balance " + balance + " too low. Mining!")
+        Cypress.config('includeShadowDom', true)
+        const device_name = "UTXO device"
+        const wallet_name = "UTXO wallet"
+        cy.addHotDevice(device_name, "bitcoin")
+        cy.addHotWallet(wallet_name, device_name, "bitcoin", "segwit")
+        cy.get('#fullbalance_amount').then(($span) => {
+            const balance = parseFloat($span.text())
+            if (balance === 20) {
                 cy.mine2wallet("btc")
                 cy.mine2wallet("btc")
-                cy.mine2wallet("btc")
+                // We are having 3 UTXO in the end (addHotWallet creates one automatically)
+            }
+            else {
+                return
             }
         })
-        
-        cy.contains(wallet_name).click()
+    })
 
-        // The table as component is only available through the shadow tree
-        // That's why we have this stupid .shadow() ...
-        cy.get('tx-table').shadow().find('.utxo-view-btn').click({ force: true })
-
-        cy.log("Check that nothis is frozen")
-        cy.get('tx-table').shadow().find('tx-row').each(($el, index, $list) => {
-            cy.wrap($el).shadow().find('.tx-row').should('not.have.class', 'frozen')
-            cy.wrap($el).shadow().find('.frozen-img').should('have.class', 'hidden')
-        })
-
-        
-        cy.log("First select it, then freeze it")
-        cy.get('tx-table').shadow().find('tx-row').eq(0).shadow().find('.select-tx-img').click()
+    it('Freezing', () => {
+        cy.selectWallet('UTXO wallet')
+        cy.get('[data-cy="utxo-list-btn"]').click()
+        cy.wait(500)
+        // Freeze 2 UTXOs 
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-img').click( {position: 'top'} )
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-value').invoke('attr', 'value').should('eq', 'true') // Check whether click worked
         cy.wait(100)
-        // then click the freeze-button
-        cy.get('tx-table').shadow().find('.freeze-tx-btn').click()
+        cy.get('tx-table').find('tx-row').eq(1).find('.select-tx-img').click( {position: 'top'} )
+        cy.get('tx-table').find('tx-row').eq(1).find('.select-tx-value').invoke('attr', 'value').should('eq', 'true') 
         cy.wait(100)
-
-        cy.get('tx-table').shadow().find('tx-row').each(($el, index, $list) => {
-            if (index == 0) {
-                cy.wrap($el).shadow().find('.tx-row').should('have.class', 'frozen')
-                cy.wrap($el).shadow().find('.frozen-img').should('not.have.class', 'hidden')
+        cy.get('tx-table').find('.freeze-tx-btn').click()
+        cy.wait(500)
+        // Check that we have 2 frozen outputs now
+        cy.get('tx-table').find('tx-row').each(($el, index) => {
+            if (index == 0 || index == 1) {
+                cy.wrap($el).find('.tx-row').should('have.class', 'frozen')
+                cy.wrap($el).find('.frozen-img').should('not.have.class', 'hidden')
             } else {
-                cy.wrap($el).shadow().find('.tx-row').should('not.have.class', 'frozen')
-                cy.wrap($el).shadow().find('.frozen-img').should('have.class', 'hidden')
+                cy.wrap($el).find('.tx-row').should('not.have.class', 'frozen')
+                cy.wrap($el).find('.frozen-img').should('have.class', 'hidden')
             }   
         })
+        // Check that we can't create a transaction when a frozen UTXO is selected ...
+        cy.get('tx-table').find('tx-row').eq(2).find('.select-tx-img').click( {position: 'top'} ) // not frozen
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-img').click( {position: 'top'} ) // frozen
+        cy.get('tx-table').find('.compose-tx-btn').should('be.hidden')
+        // ... and that the checkboxes disappear for the non-frozen UTXO and get unticked
+        cy.get('tx-table').find('tx-row').eq(2).find('.select-tx-img').should('be.hidden')
+        cy.get('tx-table').find('tx-row').eq(2).find('.select-tx-img').should('have.attr', 'src').and('contain', 'untick')
+        // Unselect the first UTXO (frozen) again and check that all checkboxes are visible and none are selected
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-img').click( {position: 'top'} )
+        cy.wait(100)
+        cy.get('tx-table').find('tx-row').each(($el, index, $list) => {
+            cy.wrap($el).find('.tx-row').find('.select-tx-img').should('not.be.hidden').should('have.attr', 'src').and('contain', 'untick')
+        })
+    })
 
-        // Test freeze UTXO can't be spend, and unfreeze works for coin selection option
-        cy.log("Select 3 UTXOs and freeze them")
-        cy.get('tx-table').shadow().find('tx-row').eq(0).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('tx-row').eq(1).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('tx-row').eq(3).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('.compose-tx-btn').click()
+    it('Creating a transaction', () => {
+        cy.selectWallet('UTXO wallet')
+        cy.get('[data-cy="utxo-list-btn"]').click()
+        cy.wait(500)
+        // Unfreeze the first UTXO in the list (Address #2) and try to make a transaction with it
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-img').click( {position: 'top'} )
+        cy.wait(100)
+        cy.get('tx-table').find('.freeze-tx-btn').click()
+        // freeze-tx-btn submits a form → full page nav. tx-table's render()
+        // awaits fetchWalletData() before attaching txRowSelected listeners,
+        // so on fast workers a click can land after tx-row creation but
+        // before the listener is live — select-tx-value toggles but the
+        // action box never reveals. Wait long enough for the async gap to close.
+        cy.wait(1000)
+        // Select it
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-img').click( {position: 'top'} );
+        cy.get('tx-table').find('tx-row').eq(0).find('.select-tx-value').invoke('attr', 'value').should('eq', 'true') // Check that the click flow is (still) in order
+        // Wait for the tx-table listener to process the selection and reveal the action box.
+        cy.get('tx-table').find('.selected-rows-action-box').should('not.have.class', 'hidden')
+        cy.get('tx-table').find('.compose-tx-btn').click()
+        // Switch to coin selection, check that the right amount of coins are preselected in the coin selection
+        cy.get('.coinselect-hidden').should('have.length', 1);
+    })
 
-        // If you select a coin from the utxo-set and cklick on "create transaction", the coins need to be preselected
-        cy.get('.coinselect-hidden').should('have.length', 3);
-
-        // Unfreeze the UTXO
+    it('Managing unsigned transactions', () => {
+        // At this point we have one frozen output left
+        // Make an unsigned tx
+        cy.selectWallet('UTXO wallet')
+        cy.get('#btn_send').click()
+        cy.get('[data-cy="coin-selection-toggle"]').click() 
+        // Make an alias of the tx row with Address #0 label 
+        cy.get('address-label[data-label="Address #0"]').closest('tr').as('unsignedTxRow')
+        cy.get('address-label[data-label="Address #1"]').closest('tr').as('frozenTxRow')
+        cy.get('address-label[data-label="Address #2"]').closest('tr').as('normalTxRow')
+        // Select this UTXO in the coin selection
+        cy.get('@unsignedTxRow').find('[data-cy="selectable-utxo-checkbox"]').click()
+        cy.get('#recipient_0').find('#address').type("bcrt1qvtdx75y4554ngrq6aff3xdqnvjhmct5wck95qs") // address from "Ghost wallet"
+        cy.get('#recipient_0').get('#send_max').click()
+        cy.get('#create_psbt_btn').click()
+        // Check the labeling of the unsigned UTXO
         cy.get('#btn_transactions').click()
         cy.wait(1000)
-        cy.get('tx-table').shadow().find('.utxo-view-btn').click()
-
-        cy.get('tx-table').shadow().find('tx-row').eq(0).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('.freeze-tx-btn').click()
-
-        cy.get('tx-table').shadow().find('tx-row').each(($el, index, $list) => {
-            cy.wrap($el).shadow().find('.tx-row').should('not.have.class', 'frozen')
-            cy.wrap($el).shadow().find('.frozen-img').should('have.class', 'hidden')
+        cy.get('[data-cy="utxo-list-btn"]').click()
+        cy.wait(500)
+        cy.get('@unsignedTxRow').should('have.attr', 'data-cy', 'unsigned-tx-row')
+        // Check that only the checkbox of the unsigned UTXO are visible if it is selected
+        cy.get('@unsignedTxRow').find('.select-tx-img').click( {position: 'top'} )
+        cy.get('@unsignedTxRow').find('.select-tx-img').should('be.visible')
+        cy.get('@frozenTxRow').find('.select-tx-img').should('be.hidden')
+        cy.get('@normalTxRow').find('.select-tx-img').should('be.hidden')
+        // Unselect the UTXO again and check that all checkboxes are visible and none are selected
+        cy.get('@unsignedTxRow').find('.select-tx-img').click( {position: 'top'} )
+        cy.get('tx-table').find('tx-row').each(($el, index, $list) => {
+            cy.wrap($el).find('.tx-row').find('.select-tx-img').should('be.visible')
         })
-
-        // Ensure selection of unfreeze now works
-        cy.get('tx-table').shadow().find('tx-row').eq(0).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('tx-row').eq(1).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('tx-row').eq(3).shadow().find('.select-tx-img').click()
-        cy.get('tx-table').shadow().find('.compose-tx-btn').click()
-
-        cy.get('.coinselect-hidden').should('have.length', 3);
-
+        // Select a normal UTXO and select an unsigned UTXO, then check that the checkbox for the normal UTXO is hidden
+        cy.get('@normalTxRow').find('.select-tx-img').click()
+        cy.get('@unsignedTxRow').find('.select-tx-img').click( {position: 'top'} )
+        cy.get('@normalTxRow').find('.select-tx-img').should('be.hidden')
+        // Unselect the unsigned UTXO again
+        cy.get('@unsignedTxRow').find('.select-tx-img').click( {position: 'top'} )
+        // Check that all checkboxes are visible again and none are selected
+        cy.get('tx-table').find('tr.tx-row').each(($el) => {
+            cy.wrap($el).find('[data-cy="checkbox-utxo-actions"]').should('be.visible')
+        })
+        // Check that the manage PSBT button is working
+        cy.get('@unsignedTxRow').find('.select-tx-img').click( {position: 'top'} )
+        cy.get('tx-table').find('#manage-psbt-btn').should('be.visible').click()
+        cy.contains("Here you can manage PSBTs") 
     })
 })

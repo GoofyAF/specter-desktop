@@ -1,4 +1,3 @@
-import cryptography
 import json
 import logging
 import os
@@ -12,16 +11,15 @@ import time
 import zipfile
 from pathlib import Path
 
+import cryptography
 import pgpy
 import requests
+from cryptoadvance.specter.util.wallet_importer import WalletImporter
 from flask import Blueprint, Flask
 from flask import current_app as app
-from flask import flash, jsonify, redirect, render_template, request, send_file, url_for
+from flask import jsonify, redirect, render_template, request, send_file, url_for
 from flask_babel import lazy_gettext as _
 from flask_login import current_user, login_required
-from cryptoadvance.specter.services.service import Service
-
-from cryptoadvance.specter.user import User, UserSecretException
 
 from ..helpers import (
     get_loglevel,
@@ -30,17 +28,31 @@ from ..helpers import (
     set_loglevel,
 )
 from ..persistence import write_devices, write_wallet
-from ..specter_error import ExtProcTimeoutException, handle_exception
+from ..server_endpoints import flash
+from ..services.service import callbacks
+from ..specter_error import SpecterError, handle_exception
+from ..user import UserSecretException
 from ..util.sha256sum import sha256sum
 from ..util.shell import get_last_lines_from_file
 from ..util.tor import start_hidden_service, stop_hidden_services
 
 logger = logging.getLogger(__name__)
 
-rand = random.randint(0, 1e32)  # to force style refresh
+rand = random.randint(0, int(1e32))  # to force style refresh
 
 # Setup endpoint blueprint
 settings_endpoint = Blueprint("settings_endpoint", __name__)
+
+
+@settings_endpoint.context_processor
+def inject_common_stuff():
+    """Can be used in all jinja2 templates of this Blueprint
+    Injects the additional settings_tabs via extentions
+    """
+    ext_settingstabs = app.specter.service_manager.execute_ext_callbacks(
+        callbacks.add_settingstabs
+    )
+    return dict(ext_settingstabs=ext_settingstabs)
 
 
 @settings_endpoint.route("/", methods=["GET"])
@@ -118,7 +130,8 @@ def general():
             app.specter.update_merkleproof_settings(
                 validate_bool=validate_merkleproof_bool
             )
-            app.specter.service_manager.set_active_services(active_services)
+            if current_user.is_admin:
+                app.specter.service_manager.set_active_services(active_services)
             app.specter.update_fee_estimator(
                 fee_estimator=fee_estimator,
                 custom_url=fee_estimator_custom_url,
@@ -137,73 +150,58 @@ def general():
             app.specter.device_manager.update()
 
             rescanning = False
+            logger.info(f"Importing {len(restore_wallets)} wallets ...")
+            counter = {
+                "success": 0,
+                "specific_error": 0,
+                "unspecific_error": 0,
+                "rescan_error": 0,
+            }
             for wallet in restore_wallets:
-                try:
-                    app.specter.wallet_manager.rpc.createwallet(
-                        os.path.join(
-                            app.specter.wallet_manager.rpc_path, wallet["alias"]
-                        ),
-                        True,
-                    )
-                except Exception as e:
-                    # if wallet already exists in Bitcoin Core
-                    # continue with the existing one
-                    if "already exists" not in str(e):
-                        flash(
-                            _("Failed to import wallet {}, error: {}").format(
-                                wallet["name"], e
-                            ),
-                            "error",
-                        )
-                        handle_exception(e)
-                        continue
-                    logger.debug(
-                        f"Wallet {wallet['alias']} already exists, skipping creation"
-                    )
-                write_wallet(wallet)
-                app.specter.wallet_manager.update(use_threading=False)
 
                 try:
-                    wallet_obj = app.specter.wallet_manager.get_by_alias(
-                        wallet["alias"]
+                    logger.info(f"Importing wallet {wallet['name']}")
+                    wallet_importer = WalletImporter(json.dumps(wallet), app.specter)
+                    wallet_importer.create_wallet(app.specter.wallet_manager)
+                    wallet_importer.rescan_as_needed(app.specter)
+                    counter["success"] += 1
+                except SpecterError as se:
+                    error_type = (
+                        "rescan_error" if "rescan" in str(se) else "specific_error"
                     )
-                    wallet_obj.keypoolrefill(0, wallet_obj.IMPORT_KEYPOOL, change=False)
-                    wallet_obj.keypoolrefill(0, wallet_obj.IMPORT_KEYPOOL, change=True)
-                    wallet_obj.import_labels(wallet.get("labels", {}))
-                    try:
-                        wallet_obj.rpc.rescanblockchain(
-                            wallet["blockheight"]
-                            if "blockheight" in wallet
-                            else get_startblock_by_chain(app.specter),
-                            no_wait=True,
-                        )
-                        app.logger.info("Rescanning Blockchain ...")
-                        rescanning = True
-                    except Exception as e:
-                        app.logger.error(
-                            "Exception while rescanning blockchain for wallet {}: {}".format(
-                                wallet["alias"], e
-                            )
-                        )
-                        flash(
-                            _("Failed to perform rescan for wallet: {}").format(e),
-                            "error",
-                        )
-                    wallet_obj.getdata()
+                    flash(f"Wallet '{wallet.get('name')}': {se} (skipped)", "error")
+                    counter[error_type] += 1
                 except Exception as e:
                     flash(
-                        _("Failed to import wallet {}").format(wallet["name"]), "error"
+                        f"Error while importing wallet {wallet['name']}, check logs for details! (skipped)",
+                        "error",
                     )
-                    handle_exception(e)
-            flash(_("Specter data was successfully loaded from backup"), "info")
+                    logger.exception(
+                        f"Error while importing wallet {wallet['name']}: {e}"
+                    )
+                    counter["unspecific_error"] += 1
+
+            counter["errors_sum"] = (
+                counter["rescan_error"]
+                + counter["specific_error"]
+                + counter["unspecific_error"]
+            )
+            if counter["success"] > 0:
+                message = f"{counter['success']} wallets successfully restored. "
+
+            else:
+                message = f"Sorry, this doesn't went that well. "
+            if counter["errors_sum"] > 0:
+                message += "however, we had " if counter["success"] > 0 else "We had "
+                message += f"""<br>
+                Successful imports: {counter["success"]}<br>
+                Specific errors:    {counter["specific_error"]}<br>
+                Unspecific errors:  {counter["unspecific_error"]} (create an issue about it on github)<br>
+                Rescan issues:      {counter["rescan_error"]}<br>
+                """
             if rescanning:
-                flash(
-                    _(
-                        "Wallets are rescanning for transactions history.\n\
-This may take a few hours to complete."
-                    ),
-                    "info",
-                )
+                message += "Wallets are rescanning for transactions history. This may take a few hours to complete."
+            flash(message, "info")
 
     return render_template(
         "settings/general_settings.jinja",
@@ -224,7 +222,7 @@ This may take a few hours to complete."
 @login_required
 def tor():
     """
-    controls the tor related settings
+    Controls the Tor related settings
     GET for displaying the page, POST for updates
     param action might be "save", "test_tor" or "toggle_hidden_service"
     param proxy_url the Tor deamon url, usually something like socks5h://localhost:9050
@@ -237,8 +235,11 @@ def tor():
     current_version = notify_upgrade(app, flash)
     proxy_url = app.specter.proxy_url
     only_tor = app.specter.only_tor
+    unselectOnlyTor = False
     tor_control_port = app.specter.tor_control_port
     tor_type = app.specter.tor_type
+    # This is true if the Python interpreter has been bundled with the application into a single executable, so basically it is true for the apps but not for pip-installations
+    tor_builtin_possible = getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
     if request.method == "POST":
         action = request.form["action"]
         tor_type = request.form["tor_type"]
@@ -248,17 +249,64 @@ def tor():
         hidden_service = request.form.get("hidden_service") == "on"
 
         if action == "save":
-            logger.info("Updating Tor settings...")
-            app.specter.update_tor_type(tor_type, current_user)
+            # Remove the built-in Tor setup if the user has it and is checking the "Disabled" radio button
+            if tor_type == "disabled" and app.specter.tor_type == "builtin":
+                if app.specter.is_tor_dameon_running():
+                    app.specter.tor_daemon.stop_tor_daemon()
+                shutil.rmtree(os.path.join(app.specter.data_folder, "tor-binaries"))
+                os.remove(os.path.join(app.specter.data_folder, "torrc"))
+                flash("Tor disabled. Built-in Tor setup uninstalled")
+                # Also reset Tor only mode if it was used
+                if app.specter.only_tor:
+                    unselectOnlyTor = True
+                    app.specter.update_only_tor(False, current_user)
+            # Reset Tor only mode if it was used if user chooses the disable option
+            if tor_type == "disabled" and app.specter.tor_type == "custom":
+                if app.specter.only_tor:
+                    unselectOnlyTor = True
+                    app.specter.update_only_tor(False, current_user)
 
             if tor_type == "custom":
-                app.specter.update_proxy_url(proxy_url, current_user)
-                app.specter.update_tor_control_port(tor_control_port, current_user)
+                # Only save the custom setup if we can connect
+                try:
+                    requests_session = requests.Session()
+                    requests_session.proxies["http"] = proxy_url
+                    requests_session.proxies["https"] = proxy_url
+                    res = requests_session.get(
+                        "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/",  # Tor Project onion v3 website
+                        timeout=30,
+                    )
+                    if res.status_code == 200:
+                        app.specter.update_proxy_url(proxy_url, current_user)
+                        app.specter.update_tor_control_port(
+                            tor_control_port, current_user
+                        )
+                        flash(_("Custom Tor setup is working and saved!"), "info")
+                except Exception:
+                    flash(
+                        _("Custom Tor setup is not working and couldn't be saved!"),
+                        "error",
+                    )
+                    return redirect(request.referrer or "/")
             else:
                 proxy_url = "socks5h://localhost:9050"
                 tor_control_port = ""
 
-            app.specter.update_only_tor(only_tor, current_user)
+            logger.info("Updating Tor settings...")
+            app.specter.update_tor_type(tor_type, current_user)
+
+            # Updates "only_tor" to True only if tor_type is not "disabled"; setting to False without check for existing Tor config
+            if only_tor == True:
+                if tor_type == "disabled":
+                    flash(
+                        "You can't enforce to use Tor with Tor being disabled.", "error"
+                    )
+                    unselectOnlyTor = True
+                else:
+                    app.specter.update_only_tor(only_tor, current_user)
+            else:
+                app.specter.update_only_tor(only_tor, current_user)
+
             if hidden_service != app.specter.config["tor_status"]:
                 if not app.config["DEBUG"]:
                     if app.specter.config["auth"].get("method", "none") == "none":
@@ -302,19 +350,25 @@ def tor():
             logger.info("Starting Tor...")
             try:
                 app.specter.tor_daemon.start_tor_daemon()
+                if only_tor:
+                    app.specter.update_only_tor(True, current_user)
                 flash(_("Specter has started Tor"))
             except Exception as e:
                 flash(_("Failed to start Tor, error: {}").format(e), "error")
                 logger.error(f"Failed to start Tor, error: {e}")
+
         elif action == "stoptor":
             logger.info("Stopping Tor...")
             try:
                 app.specter.tor_daemon.stop_tor_daemon()
-                time.sleep(1)
+                time.sleep(2)
+                if app.specter.only_tor:
+                    unselectOnlyTor = True
+                    app.specter.update_only_tor(False, current_user)
                 flash(_("Specter stopped Tor successfully"))
             except Exception as e:
                 flash(_("Failed to stop Tor, error: {}").format(e), "error")
-                logger.error(f"Failed to start Tor, error: {e}")
+                logger.exception(f"Failed to stop Tor, error: {e}", e)
         elif action == "uninstalltor":
             logger.info("Uninstalling Tor...")
             try:
@@ -322,10 +376,12 @@ def tor():
                     app.specter.tor_daemon.stop_tor_daemon()
                 shutil.rmtree(os.path.join(app.specter.data_folder, "tor-binaries"))
                 os.remove(os.path.join(app.specter.data_folder, "torrc"))
+                tor_type = "disabled"
+                app.specter.update_tor_type(tor_type, current_user)
                 flash(_("Tor uninstalled successfully"))
             except Exception as e:
                 flash(_("Failed to uninstall Tor, error: {}").format(e), "error")
-                logger.error(f"Failed to uninstall Tor, error: {e}")
+                logger.exception(f"Failed to uninstall Tor, error: {e}", e)
         elif action == "test_tor":
             logger.info("Testing the Tor connection...")
             try:
@@ -360,7 +416,9 @@ def tor():
                     _("Failed to make test request over Tor.\nError: {}").format(e),
                     "error",
                 )
-                logger.error(f"Failed to make test request over Tor.\nError: {e}")
+                logger.exception(
+                    f"Failed to make test request over Tor.\nError: {e}", e
+                )
                 if tor_type == "builtin":
                     logger.error("Tor-Logs:")
                     app.specter.tor_daemon.stop_tor_daemon()
@@ -372,8 +430,10 @@ def tor():
     return render_template(
         "settings/tor_settings.jinja",
         tor_type=tor_type,
+        tor_builtin_possible=tor_builtin_possible,
         proxy_url=proxy_url,
         only_tor=only_tor,
+        unselectOnlyTor=unselectOnlyTor,
         tor_control_port=tor_control_port,
         tor_service_id=app.tor_service_id,
         torbrowser_installed=os.path.isfile(app.specter.torbrowser_path),
@@ -558,12 +618,11 @@ def auth():
                     users = None
                     app.config["LOGIN_DISABLED"] = True
 
-                    # Cannot support Services if there's no password (admin was already
-                    # warned about this in the UI). Remove User.services, clear the
-                    # `user_secret`, and wipe the ServiceEncryptedStorage.
-                    app.specter.service_manager.remove_all_services_from_user(
-                        current_user
-                    )
+                    # if there is no password, we have to delete the previously encrypted data from services
+                    for user in app.specter.user_manager.users:
+                        app.specter.service_manager.delete_services_with_encrypted_storage(
+                            user
+                        )
 
             # Redirect if a URL was given via the next variable
             if request.form.get("next") and request.form.get("next") != "":
@@ -655,6 +714,7 @@ def set_asset_label():
     try:
         app.specter.update_asset_label(asset, label)
     except Exception as e:
+        logger.exception(e)
         return str(e), 500
     return {"success": True}
 
@@ -679,6 +739,7 @@ def get_asset(asset):
             return {"error": "asset lookup by label failed"}, 404
         return {"asset": asset, "label": app.specter.asset_label(asset)}
     except Exception as e:
+        logger.exception(e)
         return {"error": str(e)}, 500
 
 
@@ -690,6 +751,6 @@ def get_asset(asset):
 def backup_file():
     return send_file(
         app.specter.specter_backup_file(),
-        attachment_filename="specter-backup.zip",
+        download_name="specter-backup.zip",
         as_attachment=True,
     )

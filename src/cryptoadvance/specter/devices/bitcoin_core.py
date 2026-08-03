@@ -7,22 +7,22 @@ from io import BytesIO
 from embit import bip32, bip39, networks
 
 from ..device import Device
-from ..helpers import alias
+from ..helpers import create_unique_id
 from ..key import Key
 from ..rpc import get_default_datadir
 from ..specter_error import SpecterError
 from ..util.base58 import decode_base58, encode_base58_checksum
 from ..util.descriptor import AddChecksum
 from ..util.xpub import convert_xpub_prefix, get_xpub_fingerprint
-from . import DeviceTypes
+from ..util.mnemonic import mnemonic_to_root
 
 logger = logging.getLogger(__name__)
 
 
 class BitcoinCore(Device):
-    device_type = DeviceTypes.BITCOINCORE
+    device_type = "bitcoincore"
     name = "Bitcoin Core (hot wallet)"
-    icon = "bitcoincore_icon.svg"
+    icon = "img/devices/bitcoincore_icon.svg"
 
     hot_wallet = True
     taproot_support = True
@@ -65,13 +65,17 @@ class BitcoinCore(Device):
 
     def taproot_available(self, rpc):
         try:
-            # currently only master branch supports tr() descriptors
-            # TODO: replace to 220000
             core_version = rpc.getnetworkinfo().get("version", 0)
-            info = rpc.getblockchaininfo()
-            taproot_active = (core_version >= 219900) and (
-                info.get("softforks", {}).get("taproot", {}).get("active", False)
-            )
+            if core_version >= 240000:
+                # Core 24 moved softfork status from getblockchaininfo.softforks
+                # to the getdeploymentinfo RPC's deployments field.
+                deployments = rpc.getdeploymentinfo().get("deployments", {})
+                taproot_active = deployments.get("taproot", {}).get("active", False)
+            else:
+                softforks = rpc.getblockchaininfo().get("softforks", {})
+                taproot_active = (core_version >= 219900) and softforks.get(
+                    "taproot", {}
+                ).get("active", False)
             taproot_support = self.use_descriptors(rpc) and taproot_active
             self.taproot_support = taproot_support
             return taproot_support
@@ -95,8 +99,7 @@ class BitcoinCore(Device):
             keys_range[0] = int(keys_range[0])
         if type(keys_range[1]) == str:
             keys_range[1] = int(keys_range[1])
-        seed = bip39.mnemonic_to_seed(mnemonic, passphrase)
-        root = bip32.HDKey.from_seed(seed)
+        root = mnemonic_to_root(mnemonic, passphrase)
         network = networks.NETWORKS["test" if testnet else "main"]
         root.version = network["xprv"]
         xprv = root.to_base58()
@@ -116,9 +119,11 @@ class BitcoinCore(Device):
             {
                 "desc": AddChecksum(
                     "{}({}{}/0/*)".format(
-                        "tr"
-                        if path.startswith("m/86h") and taproot_available
-                        else "wpkh",
+                        (
+                            "tr"
+                            if path.startswith("m/86h") and taproot_available
+                            else "wpkh"
+                        ),
                         xprv,
                         path.rstrip("/").replace("m", ""),
                     )
@@ -131,9 +136,11 @@ class BitcoinCore(Device):
             {
                 "desc": AddChecksum(
                     "{}({}{}/1/*)".format(
-                        "tr"
-                        if path.startswith("m/86h") and taproot_available
-                        else "wpkh",
+                        (
+                            "tr"
+                            if path.startswith("m/86h") and taproot_available
+                            else "wpkh"
+                        ),
                         xprv,
                         path.rstrip("/").replace("m", ""),
                     )
@@ -145,7 +152,7 @@ class BitcoinCore(Device):
         ]
 
         if use_descriptors:
-            rpc.importdescriptors(args)
+            rpc.importdescriptors(args, timeout=15)
         else:
             rpc.importmulti(args, {"rescan": False})
 
@@ -171,11 +178,11 @@ class BitcoinCore(Device):
                         xpub, keys_purposes[i] if len(keys_purposes) > i else ""
                     )
                 )
-            except Exception:
+            except Exception as e:
                 # TODO: This should never occur, but just in case,
                 # we must make sure to catch it properly so it
                 # doesn't crash the app no matter what.
-                raise Exception("Failed to parse this xpub:\n" + "\n".join(xpub))
+                raise Exception("Failed to parse this xpub:\n" + "\n".join(xpub), e)
         self.add_keys(keys)
 
     def _load_wallet(self, wallet_manager):
@@ -204,6 +211,7 @@ class BitcoinCore(Device):
             return "unlocked_until" in info
         except Exception as e:
             logger.warning("Cannot fetch hot wallet info")
+            logger.exception(e)
         # Assuming encrypted by default
         return True
 
@@ -270,7 +278,7 @@ class BitcoinCoreWatchOnly(BitcoinCore):
     It can be converted back to a device of Type BitcoinCore by providing the 12 words again.
     """
 
-    device_type = DeviceTypes.BITCOINCORE_WATCHONLY
+    device_type = "bitcoincore_watchonly"
     name = "Bitcoin Core (watch only)"
     hot_wallet = False
 
@@ -305,6 +313,6 @@ class BitcoinCoreWatchOnly(BitcoinCore):
         )
 
         # Change type (also triggers write to file)
-        self.set_type(DeviceTypes.BITCOINCORE)
+        self.set_type(BitcoinCore.device_type)
         # After update this device will be available as a BitcoinCore (hot) instance
-        self.manager.update()
+        self.manager.update(comment="via BitcoinCoreWatchOnly")

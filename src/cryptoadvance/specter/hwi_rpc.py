@@ -1,29 +1,35 @@
-from hwilib.psbt import PSBT
-from hwilib.common import Chain
-import hwilib.commands as hwi_commands
-from .helpers import locked
-from .util.xpub import convert_xpub_prefix
-from .util.json_rpc import JSONRPC
-from .util.descriptor import AddChecksum
+import logging
 import threading
-from .devices import __all__ as device_classes
 from contextlib import contextmanager
+from typing import Callable
+
+import hwilib.commands as hwi_commands
 from embit import bip32
 from embit.liquid import networks
-import logging
-import bitbox02
-from typing import Callable
 from flask import current_app as app
+from hwilib.common import Chain
+from hwilib.devices.bitbox02 import Bitbox02Client
+from hwilib.devices.bitbox02_lib.util import BitBoxAppNoiseConfig
+from hwilib.devices.trezorlib.transport import get_transport
+from hwilib.psbt import PSBT
+from usb1 import USBError
+
+from .devices import __all__ as device_classes
+from .devices.hwi.jade import JadeClient
+from .devices.hwi.specter_diy import SpecterClient
 from .helpers import (
     deep_update,
     hwi_get_config,
-    save_hwi_bridge_config,
-    is_testnet,
     is_liquid,
+    is_testnet,
+    locked,
+    save_hwi_bridge_config,
 )
-from hwilib.devices.bitbox02 import Bitbox02Client
-from .devices.hwi.specter_diy import SpecterClient
-from .devices.hwi.jade import JadeClient
+
+# deprecated, use embit.descriptor.checksum.add_checksum
+from .util.descriptor import AddChecksum
+from .util.json_rpc import JSONRPC
+from .util.xpub import convert_xpub_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +39,7 @@ hwi_classes = [cls for cls in device_classes if cls.hwi_support]
 hwilock = threading.Lock()
 
 
-class BitBox02NoiseConfig(bitbox02.util.BitBoxAppNoiseConfig):
+class BitBox02NoiseConfig(BitBoxAppNoiseConfig):
     def show_pairing(self, code: str, device_response: Callable[[], bool]) -> bool:
         config = hwi_get_config(app.specter)
         config["bitbox02_pairing_code"] = code
@@ -60,7 +66,7 @@ class HWIBridge(JSONRPC):
     All methods of this class are callable over JSON-RPC, except _underscored.
     """
 
-    def __init__(self):
+    def __init__(self, skip_hwi_initialisation=False):
         self.exposed_rpc = {
             "enumerate": self.enumerate,
             "detect_device": self.detect_device,
@@ -73,13 +79,20 @@ class HWIBridge(JSONRPC):
             "sign_tx": self.sign_tx,
             "sign_message": self.sign_message,
             "extract_master_blinding_key": self.extract_master_blinding_key,
+            "register_multisig": self.register_multisig,  # currently only Jade
             "bitbox02_pairing": self.bitbox02_pairing,
         }
+        if skip_hwi_initialisation:
+            self.is_startup = False
+            self.devices = []
+            return
         # Running enumerate after beginning an interaction with a specific device
         # crashes python or make HWI misbehave. For now we just get all connected
         # devices once per session and save them.
-        print("Initializing HWI...")  # to explain user why it takes so long
+        logger.info("Initializing HWI...")
+        self.is_startup = True  # to explain user why it takes so long
         self.enumerate()
+        logger.info("Finished initializing HWI!")
 
     @locked(hwilock)
     def enumerate(self, passphrase="", chain=""):
@@ -88,42 +101,32 @@ class HWIBridge(JSONRPC):
         Standard HWI enumerate() command + Specter.
         """
         devices = []
-        # going through all device classes
+        # Call device-specific enumerate (can come from hwi lib or from the Specter code base) for each Specter device class
         for devcls in hwi_classes:
             try:
-                # calling device-specific enumerate
-                if passphrase is not None:
-                    devs = devcls.enumerate(passphrase)
-                # not sure if it will handle passphrase correctly
-                # so remove it if None
+                # Special handling of the Jade to unsure it is not prompting to unlock the device on startup
+                if devcls.__name__ == "Jade":
+                    skip_unlocking = self.is_startup
+                    client_chain = Chain.argparse(chain)  # This returns an enum member
+                    devs = devcls.enumerate(
+                        skip_unlocking=skip_unlocking, chain=client_chain
+                    )
                 else:
-                    devs = devcls.enumerate()
-                # extracting fingerprint info
-                for dev in devs:
-                    # we can't get fingerprint if device is locked
-                    if "needs_pin_sent" in dev and dev["needs_pin_sent"]:
-                        continue
-                    # we can't get fingerprint if passphrase is not provided
-                    if (
-                        "needs_passphrase_sent" in dev
-                        and dev["needs_passphrase_sent"]
-                        and passphrase is None
-                    ):
-                        continue
-                    client = None
-                    try:
-                        client = devcls.get_client(dev["path"], passphrase)
-                        if isinstance(client, Bitbox02Client):
-                            client.set_noise_config(BitBox02NoiseConfig())
-                        dev["fingerprint"] = client.get_master_fingerprint().hex()
-                    finally:
-                        if client is not None:
-                            client.close()
+                    if passphrase:
+                        devs = devcls.enumerate(passphrase)
+                    else:
+                        devs = devcls.enumerate()
                 devices += devs
-            except Exception as e:
-                logger.warning(f"enumerate failed: {e}")
+            except USBError as e:
+                logger.warning(
+                    f"an error {e} was thrown which might indicate that an USB device is connected, which is deferring the startup"
+                )
+                logger.warning(
+                    f"Consider to unplug USB devices to speed up the boot process"
+                )
 
         self.devices = devices
+        self.is_startup = False
         return self.devices
 
     def detect_device(
@@ -196,6 +199,7 @@ class HWIBridge(JSONRPC):
             with self._get_client(
                 device_type=device_type, path=path, passphrase=passphrase, chain=chain
             ) as client:
+                logger.debug(f"client is : {client}")
                 return hwi_commands.send_pin(client, pin)
         else:
             raise Exception(
@@ -260,20 +264,55 @@ class HWIBridge(JSONRPC):
                     derivation, default="xpub", network=network
                 )
                 xpub = convert_xpub_prefix(xpub, slip132_prefix)
+                if derivation == "m":
+                    return "[{}]{}\n".format(master_fpr, xpub)
                 return "[{}/{}]{}\n".format(master_fpr, derivation.split("m/")[1], xpub)
             except Exception as e:
                 logger.warning(
                     f"Failed to import Nested Segwit singlesig mainnet key. Error: {e}"
                 )
+                logger.exception(e)
 
     @locked(hwilock)
     def display_address(
         self,
-        descriptor={},
+        descriptor="",
+        xpubs_descriptor="",
         device_type=None,
         path=None,
         fingerprint=None,
         passphrase="",
+        chain="",
+    ):
+        if descriptor == "" and xpubs_descriptor == "":
+            raise Exception("Descriptor must not be empty")
+
+        with self._get_client(
+            device_type=device_type,
+            fingerprint=fingerprint,
+            path=path,
+            passphrase=passphrase,
+            chain=chain,
+        ) as client:
+            if xpubs_descriptor:
+                status = hwi_commands.displayaddress(client, desc=xpubs_descriptor)
+            else:
+                status = hwi_commands.displayaddress(client, desc=descriptor)
+            if "error" in status:
+                raise Exception(status["error"])
+            elif "address" in status:
+                return status["address"]
+            else:
+                raise Exception("Failed to validate address on device: Unknown Error")
+
+    @locked(hwilock)
+    def register_multisig(
+        self,
+        device_type=None,
+        path=None,
+        passphrase="",
+        fingerprint=None,
+        descriptor="",
         chain="",
     ):
         if descriptor == "":
@@ -286,25 +325,13 @@ class HWIBridge(JSONRPC):
             passphrase=passphrase,
             chain=chain,
         ) as client:
-            if descriptor.get("xpubs_descriptor", None):
-                try:
-                    status = hwi_commands.displayaddress(
-                        client, desc=descriptor["xpubs_descriptor"]
-                    )
-                except Exception:
-                    status = hwi_commands.displayaddress(
-                        client, desc=descriptor.get("descriptor", "")
-                    )
-            else:
-                status = hwi_commands.displayaddress(
-                    client, desc=descriptor.get("descriptor", "")
+            try:
+                return client.register_multisig(descriptor)
+            except Exception as e:
+                logger.exception(e)
+                raise Exception(
+                    f"Failed to register multisig on the device. Error: {e}"
                 )
-            if "error" in status:
-                raise Exception(status["error"])
-            elif "address" in status:
-                return status["address"]
-            else:
-                raise Exception("Failed to validate address on device: Unknown Error")
 
     @locked(hwilock)
     def sign_tx(
@@ -387,6 +414,7 @@ class HWIBridge(JSONRPC):
                 logger.warning(
                     f"Failed to get the master blinding key from the device. Error: {e}"
                 )
+                logger.exception(e)
 
     def bitbox02_pairing(self, chain=""):
         config = hwi_get_config(app.specter)
@@ -415,22 +443,24 @@ class HWIBridge(JSONRPC):
             )
         devcls = get_device_class(device["type"])
         if devcls:
-            client = devcls.get_client(device["path"], passphrase)
+            # Jade needs the chain/network already here for the the auth_call
+            if devcls.__name__ == "Jade":
+                client_chain = Chain.argparse(chain)
+                client = devcls.get_client(
+                    path=device["path"],
+                    password=passphrase,
+                    expert=False,
+                    chain=client_chain,
+                )
+            else:
+                client = devcls.get_client(device["path"], passphrase)
         if not client:
             raise Exception(
                 "The device was identified but could not be reached.  Please check it is properly connected and try again"
             )
         try:
-            if is_liquid(chain):
-                client.chain = Chain.TEST if is_testnet(chain) else Chain.MAIN
-            else:
+            if type(client) is not JadeClient:
                 client.chain = Chain.argparse(chain)
-            # hack for Jade
-            if type(client) is JadeClient:
-                if is_liquid(chain):
-                    client.set_liquid_network(chain)
-                elif chain == "signet":
-                    client.chain = Chain.TEST
             yield client
         finally:
             client.close()
@@ -461,6 +491,7 @@ class HWIBridge(JSONRPC):
                 logger.warning(
                     f"Failed to import Nested Segwit singlesig mainnet key. Error {e}"
                 )
+                logger.exception(e)
 
             try:
                 # native Segwit
@@ -469,8 +500,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 zpub = convert_xpub_prefix(xpub, b"\x04\xb2\x47\x46")
                 xpubs += "[{}/84'/0'/{}']{}\n".format(master_fpr, account, zpub)
-            except Exception:
-                logger.warning("Failed to import native Segwit singlesig mainnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import native Segwit singlesig mainnet key: {e}"
+                )
+                logger.exception(e)
 
             try:
                 # Multisig nested Segwit
@@ -479,8 +513,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 Ypub = convert_xpub_prefix(xpub, b"\x02\x95\xb4\x3f")
                 xpubs += "[{}/48'/0'/{}'/1']{}\n".format(master_fpr, account, Ypub)
-            except Exception:
-                logger.warning("Failed to import Nested Segwit multisig mainnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import Nested Segwit multisig mainnet key: {e}"
+                )
+                logger.exception(e)
 
             try:
                 # Multisig native Segwit
@@ -489,8 +526,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 Zpub = convert_xpub_prefix(xpub, b"\x02\xaa\x7e\xd3")
                 xpubs += "[{}/48'/0'/{}'/2']{}\n".format(master_fpr, account, Zpub)
-            except Exception:
-                logger.warning("Failed to import native Segwit multisig mainnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import native Segwit multisig mainnet key {e}"
+                )
+                logger.exception(e)
 
             # And testnet
             client.chain = Chain.TEST
@@ -502,8 +542,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 upub = convert_xpub_prefix(xpub, b"\x04\x4a\x52\x62")
                 xpubs += "[{}/49'/1'/{}']{}\n".format(master_fpr, account, upub)
-            except Exception:
-                logger.warning("Failed to import Nested Segwit singlesig testnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import Nested Segwit singlesig testnet key: {e}"
+                )
+                logger.exception(e)
 
             try:
                 # Testnet native Segwit
@@ -512,8 +555,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 vpub = convert_xpub_prefix(xpub, b"\x04\x5f\x1c\xf6")
                 xpubs += "[{}/84'/1'/{}']{}\n".format(master_fpr, account, vpub)
-            except Exception:
-                logger.warning("Failed to import native Segwit singlesig testnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import native Segwit singlesig testnet key: {e}"
+                )
+                logger.exception(e)
 
             try:
                 # Testnet multisig nested Segwit
@@ -522,10 +568,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 Upub = convert_xpub_prefix(xpub, b"\x02\x42\x89\xef")
                 xpubs += "[{}/48'/1'/{}'/1']{}\n".format(master_fpr, account, Upub)
-            except Exception:
+            except Exception as e:
                 logger.warning(
-                    "Failed to import Nested Segwit multisigsig testnet key."
+                    f"Failed to import Nested Segwit multisigsig testnet key: {e}"
                 )
+                logger.exception(e)
 
             try:
                 # Testnet multisig native Segwit
@@ -534,8 +581,11 @@ class HWIBridge(JSONRPC):
                 ).to_string()
                 Vpub = convert_xpub_prefix(xpub, b"\x02\x57\x54\x83")
                 xpubs += "[{}/48'/1'/{}'/2']{}\n".format(master_fpr, account, Vpub)
-            except Exception:
-                logger.warning("Failed to import native Segwit multisig testnet key.")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to import native Segwit multisig testnet key: {e}"
+                )
+                logger.exception(e)
 
             # Do proper cleanup otherwise have to reconnect device to access again
             client.close()

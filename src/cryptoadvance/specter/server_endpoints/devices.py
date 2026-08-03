@@ -1,24 +1,32 @@
 import copy
 import json
+import logging
 import random
 import re
+from cryptoadvance.specter.device import Device
 
-from cryptoadvance.specter.devices.device_types import DeviceTypes
 from flask import Blueprint, Flask
 from flask import current_app as app
-from flask import flash, jsonify, redirect, render_template, request, url_for
+from flask import jsonify, redirect, render_template, request, url_for
 from flask_babel import lazy_gettext as _
 from flask_login import current_user, login_required
 from mnemonic import Mnemonic
+from cryptoadvance.specter.devices.elements_core import ElementsCore
+from cryptoadvance.specter.managers.node_manager import NodeManager
+from cryptoadvance.specter.node import Node
 
-from ..devices.bitcoin_core import BitcoinCore
-from ..helpers import generate_mnemonic, is_testnet, validate_mnemonic
+from ..devices.bitcoin_core import BitcoinCore, BitcoinCoreWatchOnly
+from ..helpers import is_testnet
 from ..key import Key
 from ..managers.device_manager import get_device_class
+from ..server_endpoints import flash
 from ..specter_error import handle_exception
+from ..util.mnemonic import generate_mnemonic, validate_mnemonic
 from ..wallet import purposes
 
-rand = random.randint(0, 1e32)  # to force style refresh
+logger = logging.getLogger(__name__)
+
+rand = random.randint(0, int(1e32))  # to force style refresh
 
 # Setup endpoint blueprint
 devices_endpoint = Blueprint("devices_endpoint", __name__)
@@ -39,6 +47,8 @@ def new_device_type():
 @devices_endpoint.route("/new_device_keys/<device_type>/", methods=["GET", "POST"])
 @login_required
 def new_device_keys(device_type):
+    device_class = get_device_class(device_type)
+    template = device_class.template
     err = None
     mnemonic = ""
     passphrase = ""
@@ -61,7 +71,7 @@ def new_device_keys(device_type):
                 err = _("Device name cannot be empty")
             elif device_name in app.specter.device_manager.devices_names:
                 err = _("Device with this name already exists")
-        xpubs_rows_count = int(request.form["xpubs_rows_count"]) + 1
+        xpubs_rows_count = int(request.form.get("xpubs_rows_count", 0)) + 1
         keys = []
         paths = []
         keys_purposes = []
@@ -80,17 +90,19 @@ def new_device_keys(device_type):
                 except:
                     err = _("Failed to parse these xpubs") + ":\n" + "\n".join(xpub)
                     break
+        if device_type == "electrum":
+            keys.append(Key.parse_xpub(request.form["master_pub_key"]))
         if not keys and not err:
             if device_type in [
-                DeviceTypes.BITCOINCORE,
-                DeviceTypes.ELEMENTSCORE,
-                DeviceTypes.BITCOINCORE_WATCHONLY,
+                BitcoinCore.device_type,
+                ElementsCore.device_type,
+                BitcoinCoreWatchOnly.device_type,
             ]:
                 if not paths:
                     err = _("No paths were specified, please provide at least one.")
                 if err is None:
                     if existing_device:
-                        if device_type == DeviceTypes.BITCOINCORE_WATCHONLY:
+                        if device_type == BitcoinCoreWatchOnly.device_type:
                             device.setup_device(
                                 file_password, app.specter.wallet_manager
                             )
@@ -173,13 +185,15 @@ def new_device_keys(device_type):
                 )
 
     return render_template(
-        "device/new_device/new_device_keys.jinja",
-        device_class=get_device_class(device_type),
+        template,
+        device_class=device_class,
         mnemonic=mnemonic,
         passphrase=passphrase,
         file_password=file_password,
         range_start=range_start,
         range_end=range_end,
+        device_name=request.form.get("device_name", ""),
+        master_pub_key=request.form.get("master_pub_key", ""),
         existing_device=app.specter.device_manager.get_by_alias(existing_device)
         if existing_device
         else None,
@@ -203,7 +217,7 @@ def new_device_mnemonic(device_type):
             err = _(
                 "Invalid mnemonic entered: Must contain either: 12, 15, 18, 21, or 24 words."
             )
-        if not validate_mnemonic(words=request.form["mnemonic"]):
+        if not validate_mnemonic(request.form["mnemonic"]):
             err = _("Invalid mnemonic entered.")
         range_start = int(request.form["range_start"])
         range_end = int(request.form["range_end"])
@@ -266,6 +280,7 @@ def device_blinding_key(device_alias):
                 + ("?newdevice=true" if new_device else "")
             )
         except Exception as e:
+            logger.exception(e)
             flash(
                 _("Invalid master blinding key! It should be in WIF or hex format."),
                 "error",
@@ -324,7 +339,7 @@ def new_device_manual():
                     "Invalid mnemonic entered: Must contain either: 12, 15, 18, 21, or 24 words."
                 )
 
-            if not validate_mnemonic(words=request.form["mnemonic"]):
+            if not validate_mnemonic(request.form["mnemonic"]):
                 err = _("Invalid mnemonic entered.")
             range_start = int(request.form["range_start"])
             range_end = int(request.form["range_end"])
@@ -391,7 +406,7 @@ def new_device_manual():
 def device(device_alias):
     err = None
     try:
-        device = app.specter.device_manager.get_by_alias(device_alias)
+        device: Device = app.specter.device_manager.get_by_alias(device_alias)
     except:
         return render_template(
             "base.jinja", error=_("Device not found"), specter=app.specter, rand=rand
@@ -422,7 +437,7 @@ def device(device_alias):
                     bitcoin_datadir=app.specter.bitcoin_datadir,
                     chain=app.specter.chain,
                 )
-                return redirect("")
+                return redirect(url_for("welcome_endpoint.index"))
         elif action == "delete_key":
             key = Key.from_json({"original": request.form["key"]})
             wallets_with_key = [w for w in wallets if key in w.keys]
@@ -477,7 +492,16 @@ def device(device_alias):
                 )
         elif action == "settype":
             device_type = request.form["device_type"]
-            device.set_type(device_type)
+            if app.specter.node_manager.active_node.is_device_supported(
+                Device.get_device_class_by_device_type_string(device_type)
+            ):
+                device.set_type(device_type)
+            # Should actually not be possible to end up here (UI doesn't let you select this) but just in case
+            else:
+                flash(
+                    f"The device type {Device.get_device_class_by_device_type_string(device_type).name} is not supported by your connection.",
+                    "error",
+                )
     device = copy.deepcopy(device)
 
     def sort_accounts(k):
@@ -495,6 +519,12 @@ def device(device_alias):
         )
 
     device.keys.sort(key=sort_accounts, reverse=False)
+
+    # For message signing
+    origin = request.args.get("origin", "")
+    address = request.args.get("address", "")
+    derivation_path = request.args.get("derivation_path", "")
+
     return render_template(
         "device/device.jinja",
         device=device,
@@ -504,4 +534,7 @@ def device(device_alias):
         error=err,
         specter=app.specter,
         rand=rand,
+        origin=origin,
+        address=address,
+        derivation_path=derivation_path,
     )

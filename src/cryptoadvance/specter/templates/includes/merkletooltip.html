@@ -1,5 +1,12 @@
-<tool-tip title="Merkle Proof Validation">
-    {{ _('Specter-Desktop validates <a href="https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki" target="_blank">BIP 37</a> Merkle Proofs from your full node <strong>guaranteeing</strong> that transactions displayed as confirmed have been included in the specified block hash.') }}<br><br>
-    {{ _("However, a compromised full node could return a fake block that was never mined into Bitcoin's blockchain!") }}
-    {{ _("If you find the displayed block hash in other locations (other nodes, block explorers, etc) <strong>and you trust specter-desktop isn't lying to you</strong>, then you can be sure this transaction exists in their blockchain as well.") }}"
+<tool-tip>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='output.css') }}">
+
+    <h4 slot="title">{{ _("Merkle Proof Validation") }}</h4>
+    <span slot="paragraph">
+        {{ _("This option is intended for the usage of Specter Desktop with nodes that you don't fully trust (e.g. remote / cloud nodes).") }} <br>
+        {{ _("If enabled, you will see block hashes in the transactions overview.") }} <br>
+        {{ _("You can take those block hashes to double check whether they also exist in other locations (other nodes, block explorers, etc).") }} <br>
+        {{ _("If so, you can be sure that the corresponding transaction was included in this block, since there is a relationship between the blockhash and the tx.") }} <br><br>
+        {{ _("In a nutshell: It substitutes double checking a specific tx in a block explorer with checking a blockhash which increases privacy.") }}
+    </span>
 </tool-tip>

@@ -3,14 +3,13 @@ from embit import bip39
 from embit.liquid.slip77 import master_blinding_from_seed
 
 from ..helpers import is_liquid
-from . import DeviceTypes
 from .bitcoin_core import BitcoinCore
 
 
 class ElementsCore(BitcoinCore):
-    device_type = DeviceTypes.ELEMENTSCORE
+    device_type = "elementscore"
     name = "Elements Core (hot wallet)"
-    icon = "elementscore_icon.svg"
+    icon = "img/devices/elementscore_icon.svg"
 
     hot_wallet = True
     bitcoin_core_support = False
@@ -57,4 +56,4 @@ class ElementsCore(BitcoinCore):
         if self.has_key_types(wallet_type, network=network):
             return ""
         if not is_liquid(network):
-            return "This wallet can only sign on Liquid"
+            return "This hot wallet can only sign on Liquid"

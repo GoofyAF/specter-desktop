@@ -1,9 +1,15 @@
 import logging
+from cryptoadvance.specter.helpers import (
+    deep_update,
+    load_jsons,
+    is_ip_private,
+    create_unique_id,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def test_deep_update():
-    import cryptoadvance.specter.helpers as helpers
-
     base_value = {
         "pli": {"pla": "blub", "yes": "yes"},
         "pli2": ["arrayelm1", "arrayelm2", "arrayelm3"],
@@ -18,7 +24,7 @@ def test_deep_update():
         "pli": {"newSubKey": "blub2"},
         "pli2": ["arrayelm4", "arrayelm5"],
     }
-    helpers.deep_update(base_value, update_value)
+    deep_update(base_value, update_value)
     # There is now a newRootKey
     assert len(base_value) == 4
     # keys get added
@@ -26,19 +32,18 @@ def test_deep_update():
     # Arrays get replaced, not appended!
     assert len(base_value["pli2"]) == 2
     # you cannot delete stuff with empty dicts
-    helpers.deep_update(base_value, {"newRootKey": {}})
+    deep_update(base_value, {"newRootKey": {}})
     assert base_value["newRootKey"]["pla"] == "blub"
 
 
 def test_load_jsons(caplog):
     caplog.set_level(logging.INFO)
     caplog.set_level(logging.DEBUG, logger="cryptoadvance.specter")
-    import cryptoadvance.specter.helpers as helpers
 
-    mydict = helpers.load_jsons("./tests/helpers_testdata")
+    mydict = load_jsons("./tests/helpers_testdata")
     assert mydict["some_jsonfile"]["blub"] == "bla"
     assert mydict["some_other_jsonfile"]["bla"] == "blub"
-    mydict = helpers.load_jsons("./tests/helpers_testdata", "id")
+    mydict = load_jsons("./tests/helpers_testdata", "id")
     assert "some_jsonfile" not in mydict
     # instead the value for the key "id" is now used as the top-level key
     assert mydict["ID123"]["blub"] == "bla"
@@ -56,7 +61,6 @@ def test_load_jsons(caplog):
 def test_is_ip_private(caplog):
     caplog.set_level(logging.INFO)
     caplog.set_level(logging.DEBUG, logger="cryptoadvance.specter")
-    import cryptoadvance.specter.helpers as helpers
 
     # https://en.wikipedia.org/wiki/Private_network
     # For each private network address range, we are testing the lower, arbitrary middle and upper part of the range
@@ -68,14 +72,88 @@ def test_is_ip_private(caplog):
     # Randomly generated public ip addresses
     public_addresses = ["58.28.76.138", "128.5.218.201", "170.45.214.32"]
 
-    assert helpers.is_ip_private("localhost")
+    assert is_ip_private("localhost")
     for ip in priv_lo_addresses:
-        assert helpers.is_ip_private(ip)
+        assert is_ip_private(ip)
     for ip in priv_24_addresses:
-        assert helpers.is_ip_private(ip)
+        assert is_ip_private(ip)
     for ip in priv_20_addresses:
-        assert helpers.is_ip_private(ip)
+        assert is_ip_private(ip)
     for ip in priv_16_addresses:
-        assert helpers.is_ip_private(ip)
+        assert is_ip_private(ip)
     for ip in public_addresses:
-        assert not helpers.is_ip_private(ip)
+        assert not is_ip_private(ip)
+
+
+def test_create_unique_id():
+    the_same_unique_names = [
+        "ghost wallet",
+        "Ghost Wallet",
+        "GHOST WALLET",
+        "gHoSt wALlEt",
+        " Ghost-Wallet",
+        "Ghost-Wallet   ",
+        "  Ghost-Wallet ",
+        "ghost-wallet",
+        "Ghost_Wallet",
+        "ghost_wallet",
+        "ghost      wallet",
+        "ghost----wallet",
+        "Ghost Wallet?",
+        "Ghost Wallet***",
+    ]
+    assert all(
+        create_unique_id(name) == "ghost_wallet" for name in the_same_unique_names
+    )
+    not_the_same_unique_names = [
+        "ghost wallet",
+        "ghost wallet 2",
+        "ghostwallet",
+        "ghost.wallet",
+        "ghostwallet123",
+        "my_ghos_wallet",
+    ]
+    assert not all(
+        create_unique_id(name) == "ghost_wallet" for name in not_the_same_unique_names
+    )
+
+
+def test_is_relative_url():
+    """Test is_relative_url() for open redirect prevention."""
+    from cryptoadvance.specter.helpers import is_relative_url
+
+    # Valid relative URLs - should pass
+    assert is_relative_url("/")
+    assert is_relative_url("/valid/path")
+    assert is_relative_url("/path?query=value")
+    assert is_relative_url("/path#anchor")
+    assert is_relative_url("/a/b/c/d/e")
+
+    # Invalid - protocol-relative URLs (should be rejected)
+    assert not is_relative_url("//evil.com")
+
+    # Invalid - percent-encoded bypass attempts
+    assert not is_relative_url("/%09/baidu.com")  # tab -> // bypass
+    assert not is_relative_url("/%09baidu.com")
+    assert not is_relative_url("/%5c%5cevil.com")  # backslash encoding
+    assert not is_relative_url("/%20/path")  # space
+
+    # Invalid - control characters
+    assert not is_relative_url("/\x00/path")
+    assert not is_relative_url("/\x1f/path")
+    assert not is_relative_url("/\x7f/path")  # DEL character
+
+    # Invalid - whitespace
+    assert not is_relative_url("/ path")
+    assert not is_relative_url("/path ")  # trailing
+    assert not is_relative_url(" /path")  # leading
+
+    # Invalid - backslashes
+    assert not is_relative_url("/\\path")
+    assert not is_relative_url("/path\\to\\file")
+
+    # Invalid - non-relative
+    assert not is_relative_url("")
+    assert not is_relative_url("https://evil.com")
+    # /https:// passes validation - it's a local server path, not external
+    assert is_relative_url("/https://evil.com")

@@ -9,7 +9,9 @@ import requests
 import urllib3
 
 from .helpers import is_ip_private
-from .specter_error import SpecterError
+from .specter_error import SpecterError, handle_exception, BrokenCoreConnectionException
+from urllib3.exceptions import NewConnectionError
+from requests.exceptions import ConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +50,26 @@ def get_default_datadir(node_type="BTC"):
     return datadir
 
 
-def _get_rpcconfig(datadir=get_default_datadir()):
-    """returns the bitcoin.conf configurations (multiple) in a datastructure
-    for all networks of a specific datadir.
+def get_rpcconfig(datadir=get_default_datadir()) -> dict:
+    """Returns the bitcoin.conf configurations for all networks.
+    If the bitcoin.conf is empty or doesn't exist, it returns the (empty) dict defined at the start.
+    Example for regtest:
+    {'bitcoin.conf': {'default': {'regtest': '1', 'server': '1', 'rpcuser': 'satoshi', 'rpcpassword': 'secret', 'disablewallet': '0', 'fallbackfee': '0.000001'
+            }, 'main': {}, 'test': {}, 'regtest': {'rpcport': '18443'}
+        }, 'cookies': []
+    }
     """
     config = {
-        "bitcoin.conf": {"default": {}, "main": {}, "test": {}, "regtest": {}},
-        "cookies": [],
+        "bitcoin.conf": {
+            "default": {},
+            "main": {},
+            "test": {},
+            "regtest": {},
+            "signet": {},
+        },
+        "cookies": {},
     }
     if not os.path.isdir(datadir):  # we don't know where to search for files
-        logger.warning(f"{datadir} not found")
         return config
     # load content from bitcoin.conf
     bitcoin_conf_file = os.path.join(datadir, "bitcoin.conf")
@@ -81,51 +93,78 @@ def _get_rpcconfig(datadir=get_default_datadir()):
                         config["bitcoin.conf"][net.strip()][k.strip()] = v.strip()
                     else:
                         current[k.strip()] = v.strip()
-        except Exception:
+        except Exception as e:
+            handle_exception(e)
             print("Can't open %s file" % bitcoin_conf_file)
     folders = {"main": "", "test": "testnet3", "regtest": "regtest", "signet": "signet"}
     for chain in folders:
         fname = os.path.join(datadir, folders[chain], ".cookie")
         if os.path.exists(fname):
+            logger.debug(f"Found a cookie file for chain {chain}")
             try:
                 with open(fname, "r") as f:
                     content = f.read()
                     user, password = content.split(":")
                     obj = {"user": user, "password": password, "port": RPC_PORTS[chain]}
-                    config["cookies"].append(obj)
-            except:
+                    config["cookies"][chain] = obj
+            except Exception as e:
+                handle_exception(e)
                 print("Can't open %s file" % fname)
     return config
 
 
 def _detect_rpc_confs_via_datadir(config=None, datadir=get_default_datadir()):
-    if config is None:
-        config = _get_rpcconfig(datadir=datadir)
+    """returns the bitcoin.conf configuration for the network
+    specified in bitcoin.conf with testnet=1, regtest=1, etc. as
+    well as the network's auth cookie information.
+    """
+
     confs = []
-    default = {}
-    for network in config["bitcoin.conf"]:
+    conf = {}
+    networks = []
+    selected_network = "main"
+
+    if config is None:
+        config = get_rpcconfig(datadir=datadir)
+
+    if "default" in config["bitcoin.conf"]:
+        default = config["bitcoin.conf"]["default"]
+        networks.append("default")
+        if "regtest" in default and default["regtest"] == "1":
+            selected_network = "regtest"
+        elif "testnet" in default and default["testnet"] == "1":
+            selected_network = "test"
+        elif "signet" in default and default["signet"] == "1":
+            selected_network = "signet"
+
+    logger.debug(f"Bitcoin network set to {selected_network}")
+
+    # Network specific options take precedence over default ones,
+    # as per https://github.com/bitcoin/bitcoin/blob/master/doc/bitcoin-conf.md#network-specific-options
+    networks.append(selected_network)
+
+    for network in networks:
         if "rpcuser" in config["bitcoin.conf"][network]:
-            default["user"] = config["bitcoin.conf"][network]["rpcuser"]
+            conf["user"] = config["bitcoin.conf"][network]["rpcuser"]
         if "rpcpassword" in config["bitcoin.conf"][network]:
-            default["password"] = config["bitcoin.conf"][network]["rpcpassword"]
+            conf["password"] = config["bitcoin.conf"][network]["rpcpassword"]
         if "rpcconnect" in config["bitcoin.conf"][network]:
-            default["host"] = config["bitcoin.conf"][network]["rpcconnect"]
+            conf["host"] = config["bitcoin.conf"][network]["rpcconnect"]
         if "rpcport" in config["bitcoin.conf"][network]:
-            default["port"] = int(config["bitcoin.conf"][network]["rpcport"])
-        if "user" in default and "password" in default:
-            if (
-                "port" not in config["bitcoin.conf"]["default"]
-            ):  # only one rpc makes sense in this case
-                if network == "default":
-                    continue
-                default["port"] = RPC_PORTS[network]
-            confs.append(default.copy())
-    # try cookies now
-    for cookie in config["cookies"]:
+            conf["port"] = int(config["bitcoin.conf"][network]["rpcport"])
+    if conf:
+        confs.append(conf)
+
+    # Check for cookies as auth fallback, rpcpassword in bitcoin.conf takes precedence
+    # as per https://github.com/bitcoin/bitcoin/blob/master/doc/init.md#configuration
+    # Only take the selected network cookie info
+    if "cookies" in config and selected_network in config["cookies"]:
+        cookie = config["cookies"][selected_network]
         o = {}
-        o.update(default)
+        o.update(conf)
         o.update(cookie)
         confs.append(o)
+
     return confs
 
 
@@ -175,19 +214,20 @@ def autodetect_rpc_confs(
     available_conf_arr = []
     if len(conf_arr) > 0:
         for conf in conf_arr:
-            rpc = BitcoinRPC(
-                **conf, proxy_url="socks5h://localhost:9050", only_tor=False
-            )
-            if port is not None:
-                if int(rpc.port) != port:
-                    continue
+            rpc = BitcoinRPC(**conf, proxy_url=proxy_url, only_tor=only_tor)
             try:
                 rpc.getmininginfo()
                 available_conf_arr.append(conf)
             except requests.exceptions.RequestException as e:
                 pass
                 # no point in reporting that here
+            except SpecterError as e:
+                # Timeout
+                pass
             except RpcError:
+                pass
+            except BrokenCoreConnectionException:
+                # If conf's auth doesn't work, let's try cookie's auth if found
                 pass
                 # have to make a list of acceptable exception unfortunately
                 # please enlarge if you find new ones
@@ -204,10 +244,26 @@ class RpcError(Exception):
         assert rpce.error_code == -32601
         assert rpce.error_msg == "Method not found"
     See for error_codes https://github.com/bitcoin/bitcoin/blob/v0.15.0.1/src/rpc/protocol.h#L32L87
+    You can create these RpcErrors via a response-object:
+        RpcError("some Message",response)
+    or directly via:
+        raise RpcError("some Message", status_code=500, error_code=-32601, error_msg="Requested wallet does not exist or is not loaded")
+    The message is swallowed if there is a proper error_msg.
     """
 
-    def __init__(self, message, response):
+    def __init__(
+        self, message, response=None, status_code=None, error_code=None, error_msg=None
+    ):
         super(Exception, self).__init__(message)
+        if response is not None:
+            self.init_via_response(response)
+        else:
+
+            self.status_code = status_code or 500
+            self.error_code = error_code or -99
+            self.error_msg = error_msg or str(self)
+
+    def init_via_response(self, response):
         self.status_code = 500  # default
         try:
             self.status_code = response.status_code
@@ -218,9 +274,14 @@ class RpcError(Exception):
         try:
             self.error_code = error["error"]["code"]
             self.error_msg = error["error"]["message"]
-        except Exception as e:
+        except Exception:
             self.error_code = -99
-            self.error = "UNKNOWN API-ERROR:%s" % response.text
+            # Handle both Response objects and dicts
+            if hasattr(response, "text"):
+                response_text = response.text
+            else:
+                response_text = str(response)
+            self.error_msg = str(self) + " - UNKNOWN API-ERROR:%s" % response_text
 
 
 class BitcoinRPC:
@@ -279,6 +340,7 @@ class BitcoinRPC:
         self.session = session
 
     def wallet(self, name=""):
+        """Return new instance connected to a specific wallet"""
         return type(self)(
             user=self.user,
             password=self.password,
@@ -364,6 +426,9 @@ class BitcoinRPC:
             r = self.session.post(
                 url, data=json.dumps(payload), headers=headers, timeout=timeout
             )
+        except (ConnectionError, NewConnectionError, ConnectionRefusedError) as ce:
+            raise BrokenCoreConnectionException()
+
         except (requests.exceptions.Timeout, urllib3.exceptions.ReadTimeoutError) as to:
             # Timeout is effectively one of the two:
             # ConnectTimeout: The request timed out while trying to connect to the remote server
@@ -372,6 +437,7 @@ class BitcoinRPC:
             if kwargs.get("no_wait"):
                 # Used for rpc calls that don't immediately return (e.g. rescanblockchain) so we don't
                 # expect any data back anyway. __getattr__ expects a list of formatted json.
+                self.trace_call_after(url, payload, timeout)
                 return [{"error": None, "result": None}]
 
             logger.error(
@@ -383,6 +449,7 @@ class BitcoinRPC:
                     to,
                 )
             )
+            logger.exception(to)
             raise SpecterError(
                 "Timeout after {} secs while {} call({: <28}). Check the logs for more details.".format(
                     timeout,
@@ -394,11 +461,19 @@ class BitcoinRPC:
         self.trace_call_after(url, payload, ts)
         self.r = r
         if r.status_code != 200:
-            logger.debug(f"last call FAILED: {r.text} (raising RpcError)")
+            logger.debug(f"last call FAILED: {r.text}")
+            if r.text.startswith("Work queue depth exceeded"):
+                raise SpecterError(
+                    "Your Bitcoind is running hot (Work queue depth exceeded)! Bitcoind gets more requests than it can process. Please refrain from doing anything for some minutes."
+                )
             raise RpcError(
                 "Server responded with error code %d: %s" % (r.status_code, r.text), r
             )
         r = r.json()
+        # Bitcoin Core should return a list for batch requests, but some
+        # implementations or proxies may return a single object instead.
+        if isinstance(r, dict):
+            r = [r]
         return r
 
     @classmethod
@@ -438,9 +513,60 @@ class BitcoinRPC:
 
     def __getattr__(self, method):
         def fn(*args, **kwargs):
-            r = self.multi([(method, *args)], **kwargs)[0]
-            if r["error"] is not None:
-                raise RpcError("Request error: %s" % r["error"]["message"], r)
+            responses = self.multi([(method, *args)], **kwargs)
+            # Ensure multi() returned a non-empty list before indexing
+            if not isinstance(responses, list) or not responses:
+                raise RpcError(
+                    f"Request error for method {method}{args}: Invalid batch response (expected non-empty list, got {type(responses).__name__})",
+                    response=responses,
+                    error_msg=f"Invalid batch response from multi(): {responses}",
+                )
+            r = responses[0]
+            # Safely check if response is a dict and has error field
+            if not isinstance(r, dict):
+                raise RpcError(
+                    f"Request error for method {method}{args}: Invalid response format (expected dict, got {type(r).__name__})",
+                    response=None,
+                    error_msg=f"Invalid response format: {r}",
+                )
+
+            error = r.get("error")
+            if error is not None:
+                # Safely extract error message and code
+                if isinstance(error, dict):
+                    error_code = error.get("code", -99)
+                    error_msg = error.get("message", str(error))
+                    # If error has both code and message, pass the response dict
+                    # Otherwise, pass explicit error_msg/error_code to avoid overwriting
+                    if "code" in error and "message" in error:
+                        raise RpcError(
+                            f"Request error for method {method}{args}: {error_msg}",
+                            r,
+                        )
+                    else:
+                        raise RpcError(
+                            f"Request error for method {method}{args}: {error_msg}",
+                            response=None,
+                            error_code=error_code,
+                            error_msg=error_msg,
+                        )
+                else:
+                    # Error is not a dict (e.g., plain string)
+                    error_msg = str(error)
+                    raise RpcError(
+                        f"Request error for method {method}{args}: {error_msg}",
+                        response=None,
+                        error_code=-99,
+                        error_msg=error_msg,
+                    )
+
+            if "result" not in r:
+                error_msg_text = f"Unexpected RPC response for method {method}{args}: missing 'result' key"
+                raise RpcError(
+                    error_msg_text,
+                    response=None,
+                    error_msg=error_msg_text,
+                )
             return r["result"]
 
         return fn

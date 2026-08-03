@@ -46,7 +46,7 @@ class ConfigManager(GenericDataManager):
             "asset_labels": {
                 "liquidv1": {},
             },
-            "active_node_alias": "default",
+            "active_node_alias": None,
             "proxy_url": "socks5h://localhost:9050",  # Tor proxy URL
             "only_tor": False,
             "tor_control_port": "",
@@ -65,8 +65,11 @@ class ConfigManager(GenericDataManager):
             "fee_estimator": "bitcoin_core",
             "fee_estimator_custom_url": "",
             "hide_sensitive_info": False,
-            "autohide_sensitive_info_timeout_minutes": 20,
+            "autohide_sensitive_info_timeout_minutes": None,
             "autologout_timeout_hours": 4,
+            "testing": {
+                "allow_threading_for_testing": False,
+            },
             # TODO: remove
             "bitcoind": False,
         }
@@ -89,14 +92,14 @@ class ConfigManager(GenericDataManager):
                 file_config = read_json_file(self.data_file)
                 migrate_config(file_config)
                 deep_update(self.data, file_config)
+                logger.info(f"Config loaded from file {self.data_file}")
             # otherwise - create one and assign unique id
-        else:
-            # unique id of specter
-            if self.data["uid"] == "":
-                self.config["uid"] = (
-                    random.randint(0, 256**8).to_bytes(8, "big").hex()
-                )
-            self._save()
+
+        # unique id of specter
+        if self.data["uid"] == "":
+            self.data["uid"] = random.randint(0, 256**8).to_bytes(8, "big").hex()
+            logger.info(f"No uid found in config. Created uid {self.data['uid']}")
+        self._save()
 
         # config from constructor overrides file config
         deep_update(self.data, self.arg_config)
@@ -146,7 +149,7 @@ class ConfigManager(GenericDataManager):
             chain_name = (
                 ""
                 if (chain == "main" or chain == "regtest")
-                else ("signet/" if self.chain == "signet" else "testnet/")
+                else ("signet/" if chain == "signet" else "testnet/")
             )
             explorer_data["url"] += chain_name
         # update the urls in the app config
@@ -182,7 +185,7 @@ class ConfigManager(GenericDataManager):
 
     def update_tor_type(self, tor_type, user):
         """update the Tor type to use"""
-        if self.data.get("tor_type", "builtin") != tor_type:
+        if self.data.get("tor_type") != tor_type:
             self.data["tor_type"] = tor_type
             self._save()
 
@@ -202,7 +205,6 @@ class ConfigManager(GenericDataManager):
         if self.data["tor_control_port"] != tor_control_port:
             self.data["tor_control_port"] = tor_control_port
             self._save()
-            self.update_tor_controller()
 
     def generate_torrc_password(self, overwrite=False):
         if "torrc_password" not in self.data or overwrite:

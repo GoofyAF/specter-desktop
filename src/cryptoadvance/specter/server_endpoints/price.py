@@ -1,3 +1,4 @@
+import logging
 from flask import (
     Blueprint,
     request,
@@ -5,6 +6,9 @@ from flask import (
 from flask_login import login_required, current_user
 from flask import current_app as app
 from ..util.price_providers import update_price
+
+logger = logging.getLogger(__name__)
+
 
 # Setup endpoint blueprint
 price_endpoint = Blueprint("price_endpoint", __name__)
@@ -33,18 +37,15 @@ def update():
                 app.specter.price_checker.start()
             return {"success": update_price(app.specter, current_user)}
     except Exception as e:
-        app.logger.warning("Failed to update price settings. Exception: {}".format(e))
+        logger.warning("Failed to update price settings. Exception: {}".format(e))
+        logger.exception(e)
     return {"success": False}
 
 
 @price_endpoint.route("/toggle/", methods=["GET", "POST"])
 @login_required
 def toggle():
-    try:
-        app.specter.update_price_check_setting(
-            not app.specter.price_check, current_user
-        )
-        return {"success": True}
-    except Exception as e:
-        app.logger.warning("Failed to update price settings. Exception: {}".format(e))
-    return {"success": False}
+    app.specter.update_price_check_setting(not app.specter.price_check, current_user)
+    logger.info(f"update_price_check_setting to {app.specter.price_check}")
+
+    return {"success": True}

@@ -1,14 +1,14 @@
 # Tor and Specter Desktop
 
-When using Specter Desktop, there might be certain cases where you would want to make calls over the Tor network. The simplest way to setup Tor integration with Specter Desktop is to click on the Get Started button of the welcome page aand follow the setup wizard, which will install and configure Tor for you. You can also access it but going to Settings -> Tor tab, and clicking on Setup Tor.
+When using Specter Desktop, there might be certain cases where you would want to make calls over the Tor network. The simplest way to setup Tor integration with Specter Desktop is to click on the "Get Started" button of the welcome page and follow the setup wizard, which will install and configure Tor for you. You can also access it by going to `Settings -> Tor` tab, and clicking on "Setup Tor".
 
-<img width="956" alt="Screen Shot 2021-04-24 at 10 42 08" src="./images/tor/get-started-setup.png">
+<img width="956" alt="get-started-setup.png" src="../images/tor/get-started-setup.png">
 
-<img width="1043" alt="Screen Shot 2021-04-24 at 10 43 42" src="./images/tor/tor-config-setup.png">
+<img width="1043" alt="tor-config-setup.png" src="../images/tor/tor-config-setup.png">
 
 These will take you through the one click setup process, just click "Setup Tor" and Specter will take care of installing, configuring and running the Tor daemon.
 
-<img width="732" alt="Screen Shot 2021-04-24 at 10 42 17" src="./images/tor/setup-tor-daemon.png">
+<img width="732" alt="Screen Shot 2021-04-24 at 10 42 17" src="../images/tor/setup-tor-daemon.png">
 
 ## Running Specter Desktop over a Tor hidden service
 
@@ -20,15 +20,15 @@ But you can also make Specter Desktop available outside of your network via a To
 
 Make sure authentication is enabled to avoid access to your Specter by random strangers in the internet. It can be configured in the `Settings -> Authentication` tab. "Password Protection" would be the simplest authentication option, and you would normally want to select it in this case.
 
-After setting up authentication, running the hidden service to remotely access specter is as easy as going to the Settings -> Tor tab, scrolling to the bottom and clicking the "Start" button under the "Tor Hidden Service" section.
+After setting up authentication, running the hidden service to remotely access specter is as easy as going to the `Settings -> Tor` tab, scrolling to the bottom and clicking the "Start" button under the "Tor Hidden Service" section.
 
-<img width="755" alt="Screen Shot 2021-04-24 at 10 58 30" src="./images/tor/tor-hidden-service.png">
+<img width="755" alt="Screen Shot 2021-04-24 at 10 58 30" src="../images/tor/tor-hidden-service.png">
 
 ## Manual Tor configurations
 
 ### Setting up Tor using the Tor Browser
 The easiest way to use Tor with Specter is to have the [Tor Browser](https://www.torproject.org/download/) open. Just install it on your computer, open it and it will expose a Tor proxy Specter can connect to.
-To set this up, you'll just need to go to Specter's Settings -> Tor tab, then set the Tor Proxy field to: `socks5://127.0.0.1:9150` (you'll see it listed below the field as the Tor Browser default URL). Then click save and Specter should be working with Tor - just make sure to keep your Tor Browser running while using Specter.
+To set this up, you'll just need to go to Specter's `Settings -> Tor` tab, then set the Tor Proxy field to: `socks5://127.0.0.1:9150` (you'll see it listed below the field as the Tor Browser default URL). Then click save and Specter should be working with Tor - just make sure to keep your Tor Browser running while using Specter.
 
 ### Install Tor service
 Alternatively, you can setup the Tor service. Install Tor on the same server that you'll be running Specter Desktop:

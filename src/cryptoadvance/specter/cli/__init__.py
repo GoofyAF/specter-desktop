@@ -1,8 +1,13 @@
 import logging
-import click
 import os
-from .cli_server import server
+
+import click
+
+from ..server import setup_logging
+from .cli_ext import ext
+from .cli_gunicorn import gunicorn
 from .cli_noded import bitcoind, elementsd
+from .cli_server import server
 
 logger = logging.getLogger(__name__)
 
@@ -14,35 +19,18 @@ logger = logging.getLogger(__name__)
     default=False,
     help="Will trace all calls to BitcoinCore or ElementsCore if in --debug",
 )
+@click.option(
+    "--tracerequests/--no-tracerequests",
+    default=False,
+    help="Will trace all calls done via the requests module. Might be quite verbose!",
+)
 @click.pass_context
-def entry_point(config_home, debug=False, tracerpc=False):
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    if debug:
-        # No need for timestamps while developing
-        formatter = logging.Formatter("[%(levelname)7s] in %(module)15s: %(message)s")
-        logging.getLogger("cryptoadvance").setLevel(logging.DEBUG)
-    else:
-        formatter = logging.Formatter(
-            # Too early to format that via the flask-config, so let's copy it from there:
-            os.getenv(
-                "SPECTER_LOGFORMAT",
-                "[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
-            )
-        )
-        logging.getLogger("cryptoadvance").setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logging.getLogger().handlers = []
-    logging.getLogger().addHandler(ch)
-
-    if tracerpc:
-        if not debug:
-            raise Exception("--tracerpc Doesn't make sense without --debug")
-        logging.getLogger("cryptoadvance.specter.rpc").setLevel(logging.DEBUG)
-    else:
-        logging.getLogger("cryptoadvance.specter.rpc").setLevel(logging.INFO)
+def entry_point(config_home, debug=False, tracerpc=False, tracerequests=False):
+    setup_logging(debug, tracerpc, tracerequests)
 
 
 entry_point.add_command(server)
+entry_point.add_command(gunicorn)
+entry_point.add_command(ext)
 entry_point.add_command(bitcoind)
 entry_point.add_command(elementsd)

@@ -7,14 +7,11 @@ from embit import util as embit_util
 mnemonic_path = os.path.join(mnemonic.__path__[0], "wordlist")
 embit_libsecp_binary = embit_util.ctypes_secp256k1._find_library()
 
-block_cipher = None
-
 binaries = []
 if platform.system() == 'Windows':
     binaries = [("./windll/libusb-1.0.dll", ".")]
     packaged_software_datas = [
-        ('./torbrowser/tor-win64-0.4.5.7.zip', 'torbrowser'),
-        ('./bitcoind/bitcoin-0.21.1-win64.zip', 'bitcoind'),
+        ('./tor/tor-win64-0.4.8.0.tar.xz', 'tor'),
     ]
 elif platform.system() == 'Linux':
     if platform.processor() == 'aarch64': #ARM 64 bit
@@ -32,16 +29,14 @@ elif platform.system() == 'Linux':
                 binaries = [(p, ".")]
                 break
     packaged_software_datas = [
-        ('./torbrowser/tor-browser-linux64-10.0.15_en-US.tar.xz', 'torbrowser'),
-        ('./bitcoind/bitcoin-0.21.1' + ('-arm-linux-gnueabihf.tar.gz' if "armv" in platform.machine() else '-x86_64-linux-gnu.tar.gz'), 'bitcoind')
+        ('./tor/tor-linux64-0.4.8.0.tar.xz', 'tor'),
     ]
 elif platform.system() == 'Darwin':
     find_brew_libusb_proc = subprocess.Popen(['brew', '--prefix', 'libusb'], stdout=subprocess.PIPE)
     libusb_path = find_brew_libusb_proc.communicate()[0]
     binaries = [(libusb_path.rstrip().decode() + "/lib/libusb-1.0.dylib", ".")]
     packaged_software_datas = [
-        ('./torbrowser/TorBrowser-10.0.15-osx64_en-US.dmg', 'torbrowser'),
-        ('./bitcoind/bitcoin-0.21.1-osx64.tar.gz', 'bitcoind'),
+        ('./tor/tor-osx64-0.4.8.0.tar.xz', 'tor'),
     ]
 
 a = Analysis(['specterd.py'],
@@ -56,30 +51,27 @@ a = Analysis(['specterd.py'],
                     *packaged_software_datas,
              ],
              hiddenimports=[
-                'pkg_resources.py2_warn',
-                'cryptoadvance.specter.config'
+                'cryptoadvance.specter.config',
+                'tzdata' # used by apscheduler and existing hook doesn't seem to be complete
              ],
              hookspath=['hooks/'],
              runtime_hooks=[],
              excludes=[],
-             win_no_prefer_redirects=False,
-             win_private_assemblies=False,
-             cipher=block_cipher,
              noarchive=False)
 
 if platform.system() == 'Linux':
     import hwilib
     a.datas += Tree('../udev', prefix='hwilib/udev')
 
-pyz = PYZ(a.pure, a.zipped_data,
-             cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
+name=os.getenv("specterd_filename","specterd")
 exe = EXE(pyz,
           a.scripts,
           a.binaries,
           a.zipfiles,
           a.datas,
           [],
-          name='specterd',
+          name=name,
           debug=False,
           bootloader_ignore_signals=False,
           strip=False,

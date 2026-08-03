@@ -1,4 +1,3 @@
-from . import DeviceTypes
 from .cobo import Cobo
 from ..helpers import to_ascii20
 from ..util.xpub import get_xpub_fingerprint
@@ -6,9 +5,9 @@ from binascii import b2a_base64
 
 
 class Keystone(Cobo):
-    device_type = DeviceTypes.KEYSTONE
+    device_type = "keystone"
     name = "Keystone"
-    icon = "keystone_icon.svg"
+    icon = "img/devices/keystone_icon.svg"
 
     def create_psbts(self, base64_psbt, wallet):
         psbts = super().create_psbts(base64_psbt, wallet)

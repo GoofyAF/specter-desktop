@@ -3,7 +3,7 @@ import logging
 import os
 
 from cryptoadvance.specter.managers.genericdata_manager import GenericDataManager
-from cryptoadvance.specter.managers.singleton import ConfigurableSingleton
+from cryptoadvance.specter.managers.user_manager import UserManager
 from cryptoadvance.specter.specter_error import SpecterError
 from cryptoadvance.specter.user import User
 
@@ -36,6 +36,7 @@ class ServiceEncryptedStorage(GenericDataManager):
     """
 
     def __init__(self, data_folder: str, user: User, disable_decrypt: bool = False):
+
         if not user.plaintext_user_secret and not disable_decrypt:
             raise ServiceEncryptedStorageError(
                 f"User {user} must be authenticated with password before encrypted service data can be loaded"
@@ -97,20 +98,46 @@ class ServiceEncryptedStorage(GenericDataManager):
             service_data = {}
         return service_data
 
+    def remove_service_data(self, service_id: str, autosave: bool = True):
+        # Add or update fields; does not remove existing fields
+        if service_id not in self.data:
+            logger.warning(f"service_id {service_id} does not exist in self.data")
+            return
 
-class ServiceEncryptedStorageManager(ConfigurableSingleton):
-    """Singleton that manages access to users' ServiceApiKeyStorage; context-aware so it
-    knows who the current_user is for the given request context.
+        del self.data[service_id]
+        if autosave:
+            self._save()
 
-    Requires a one-time configuration call on startup in the ServiceManager.
+
+class ServiceUnencryptedStorage(ServiceEncryptedStorage):
+    """In order to use ServiceEncryptedStorage but unencrypted, we derive from that class
+    and change the datafile.
     """
 
-    @classmethod
-    def configure_instance(cls, data_folder, user_manager):
-        super().configure_instance()
-        cls._instance.data_folder = data_folder
-        cls._instance.user_manager = user_manager
-        cls._instance.storage_by_user = {}
+    def __init__(self, data_folder: str, user: User, disable_decrypt: bool = False):
+        if not disable_decrypt:
+            raise Exception(
+                "ServiceUnencryptedStorage needs to be initialized with disable_decrypt = True"
+            )
+        if disable_decrypt:
+            super().__init__(data_folder, user, disable_decrypt=True)
+
+    @property
+    def data_file(self):
+        return os.path.join(
+            self.data_folder, f"{self.user.username}_unencrypted_services.json"
+        )
+
+
+class ServiceEncryptedStorageManager:
+    """manages access to users' ServiceApiKeyStorage; context-aware so it
+    knows who the current_user is for the given request context.
+    """
+
+    def __init__(self, data_folder, user_manager: UserManager):
+        self.user_manager = user_manager
+        self.data_folder = data_folder
+        self.storage_by_user = {}
 
     def get_raw_encrypted_data(self, user: User) -> dict:
         """Doesn't attempt to decrypt the ServiceEncryptedStorage, just returns the
@@ -160,3 +187,31 @@ class ServiceEncryptedStorageManager(ConfigurableSingleton):
         )
         encrypted_storage.data = {}
         encrypted_storage._save()
+
+    def remove_service_data(self, user: User, service_id: str, autosave: bool = True):
+        if user.id in self.storage_by_user:
+            self.storage_by_user[user].remove_service_data(
+                service_id, autosave=autosave
+            )
+            logger.debug(f"Removed dervice_data from user {user.id}")
+        else:
+            logger.debug(
+                f"Could not remove dervice_data from user {user.id}, because {user.id} was not found in storage_by_user"
+            )
+
+
+class ServiceUnencryptedStorageManager(ServiceEncryptedStorageManager):
+    def __init__(self, data_folder, user_manager: UserManager):
+        self.user_manager = user_manager
+        self.data_folder = data_folder
+        self.storage_by_user = {}
+
+    def _get_current_user_service_storage(self) -> ServiceEncryptedStorage:
+        """Returns the storage-class for the current_user. Lazy_init if necessary"""
+        user = self.user_manager.get_user()
+
+        if user not in self.storage_by_user:
+            self.storage_by_user[user] = ServiceUnencryptedStorage(
+                self.data_folder, user, disable_decrypt=True
+            )
+        return self.storage_by_user[user]

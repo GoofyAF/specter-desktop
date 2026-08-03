@@ -5,9 +5,12 @@ nav:
     - Home:
       - 'Introduction': README.md
       - release-notes.md
+      - multisig-guide.md
     - User Guide:
       - faq.md
-      - multisig-security-tradeoffs.md
+      - install_guide.md
+      - DeviceCreationGuide.md
+      - WalletCreationGuide.md
       - 'Using Tor': tor.md
       - 'Signing messages': sign-message.md
     - Operating Guide:
@@ -27,7 +30,7 @@ nav:
       - build-instructions.md
       - 'Continuous Integration': continuous-integration.md
       - cypress-testing.md
-      - services/services.md
+      - 'Architectural Notes': architecture.md
       - 'Some Random Dev Thoughts': archblog.md
     - API:
       - api/README.md
@@ -37,5 +40,31 @@ nav:
       - api/ep_specter_fulltxlist.md
       - api/ep_wallets_psbt.md
       - api/ep_wallets_wallet.md
+    - Extension Development:
+      - extensions/intro.md
+      - extensions/frontend-aspects.md
+      - extensions/service-configuration.md
+      - extensions/data-storage.md
+      - extensions/callbacks.md
+      - extensions/devices.md
+      - extensions/nodes.md
+    
 theme: 
   name: readthedocs
+markdown_extensions:
+  - mdx_truly_sane_lists # pip3 install mdx_truly_sane_lists mkdocs-video
+plugins:
+  - search
+  - mkdocs-video:
+      mark: "small_video"
+      css_style:
+        width: "70%"
+        height: "15lw"
+        min-width: "300px"
+        min-height: "180px"
+  - mkdocs-video:
+      mark: "video"
+      css_style:
+        width: "100%"
+        height: "22.172vw"
+

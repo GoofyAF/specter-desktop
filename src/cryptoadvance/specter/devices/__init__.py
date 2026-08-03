@@ -1,4 +1,3 @@
-from .device_types import DeviceTypes
 from .coldcard import ColdCard
 from .trezor import Trezor
 from .ledger import Ledger
@@ -11,10 +10,10 @@ from .cobo import Cobo
 from .passport import Passport
 from .jade import Jade
 from .generic import GenericDevice
-from .electrum import Electrum
 from .bitcoin_core import BitcoinCore, BitcoinCoreWatchOnly
 from .elements_core import ElementsCore
 from .seedsigner import SeedSignerDevice
+from .keycardshell import KeycardShell
 
 # all device types
 __all__ = [
@@ -29,9 +28,9 @@ __all__ = [
     Passport,
     Jade,
     SeedSignerDevice,
-    Electrum,
     BitcoinCore,
     BitcoinCoreWatchOnly,
     ElementsCore,
+    KeycardShell,
     GenericDevice,
 ]

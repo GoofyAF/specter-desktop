@@ -13,7 +13,7 @@ from typing import List
 from .service_encrypted_storage import ServiceEncryptedStorageManager
 from .service_annotations_storage import ServiceAnnotationsStorage
 
-from cryptoadvance.specter.addresslist import Address
+from cryptoadvance.specter.services import callbacks
 
 
 logger = logging.getLogger(__name__)
@@ -24,8 +24,14 @@ devstatus_beta = "beta"
 devstatus_prod = "prod"
 
 
-class Service:
-    """A base class for Services"""
+class ServiceOptionality:
+    mandatory = "mandatory"  # mandatory is not used yet by any service. Before it can be used it has to be clarified what happens in delete_services_with_encrypted_storage of mandatory services
+    opt_in = "opt_in"
+    opt_out = "opt_out"
+
+
+class Extension:
+    """A base class for Extensions"""
 
     # These should be overrided in implementation classes
     id = None
@@ -34,9 +40,12 @@ class Service:
     logo = None
     desc = None  # TODO: rename to "description" to be explicit
     has_blueprint = True  # the default
-    # If the blueprint gets a "/svc" prefix (isolated_client = True), the login cookie won't work for all specter core functionality
-    isolated_client = True
+    # If the blueprint gets a "/ext" prefix (isolated_client = True), the login cookie won't work for all specter core functionality
+    isolated_client = False
     devstatus = devstatus_alpha
+    optionality = ServiceOptionality.opt_in
+    visible_in_sidebar = True
+    encrypt_data = False
 
     def __init__(self, active, specter):
         if not hasattr(self, "id"):
@@ -45,26 +54,39 @@ class Service:
             raise Exception(f"Service {self.__class__} needs name")
         self.active = active
         self.specter = specter
+        self.data_folder = os.path.join(self.specter.data_folder, "extensions", self.id)
+        if not os.path.exists(self.data_folder):
+            logger.info(f"Creating extension data_folder {self.data_folder} ")
+            os.makedirs(self.data_folder)
+
+    @classmethod
+    def _storage_manager(cls):
+        return (
+            app.specter.service_encrypted_storage_manager
+            if cls.encrypt_data
+            else app.specter.service_unencrypted_storage_manager
+        )
+
+    def callback(self, callback_id, *argv, **kwargv):
+        if callback_id == callbacks.after_serverpy_init_app:
+            if hasattr(self, "callback_after_serverpy_init_app"):
+                self.callback_after_serverpy_init_app(kwargv["scheduler"])
 
     @classmethod
     def set_current_user_service_data(cls, service_data: dict):
-        ServiceEncryptedStorageManager.get_instance().set_current_user_service_data(
+        cls._storage_manager().set_current_user_service_data(
             service_id=cls.id, service_data=service_data
         )
 
     @classmethod
     def update_current_user_service_data(cls, service_data: dict):
-        ServiceEncryptedStorageManager.get_instance().update_current_user_service_data(
+        cls._storage_manager().update_current_user_service_data(
             service_id=cls.id, service_data=service_data
         )
 
     @classmethod
     def get_current_user_service_data(cls) -> dict:
-        return (
-            ServiceEncryptedStorageManager.get_instance().get_current_user_service_data(
-                service_id=cls.id
-            )
-        )
+        return cls._storage_manager().get_current_user_service_data(service_id=cls.id)
 
     @classmethod
     def get_blueprint_name(cls):
@@ -114,6 +136,7 @@ class Service:
         )
         logger.debug(f"Already have {len(addresses)} addresses reserved for {cls.id}")
 
+        # More addresses ought to be reserved as there are reserved addresses
         if len(addresses) < num_addresses:
             if addresses:
                 # Continuing reserving from where we left off
@@ -134,7 +157,7 @@ class Service:
                     continue
 
                 # Mark an Address in a persistent way as being reserved by a Service
-                cls.reserve_address(wallet=wallet, address=address)
+                cls.reserve_address(wallet=wallet, address=address, label=label)
                 logger.debug(f"Reserved {address} for {cls.id}")
 
                 addresses.append(address)
@@ -143,9 +166,18 @@ class Service:
                     annotations_storage.set_addr_annotations(
                         addr=address, annotations=annotations, autosave=False
                     )
+        # There are enough addresses already reserved
+        else:
+            logger.debug(
+                f"Returning an empty list from reserve_addresses() since there are enough addresses already reserved."
+            )
+            return []
+
         if annotations:
             annotations_storage.save()
-
+        logger.debug(
+            f"Returning this list of addresses {addresses} from reserve_addresses()."
+        )
         return addresses
 
     @classmethod
@@ -186,3 +218,38 @@ class Service:
     @classmethod
     def on_user_login(cls):
         pass
+
+    @classmethod
+    def inject_in_basejinja_head(cls):
+        """overwrite this method to inject a snippet of code in specter's base.jinja
+        the snippet will be placed at the end of the head-section
+        a typical implementation would be something like:
+        return render_template("myext/inject_in_basejinja_head.jinja")
+        """
+        pass
+
+    @classmethod
+    def inject_in_basejinja_body_top(cls):
+        """overwrite this method to inject a snippet of code in specter's base.jinja
+        the snippet will be placed at the top of the body-section
+        a typical implementation would be something like:
+        return render_template("myext/inject_in_basejinja_body_top.jinja")
+        """
+        pass
+
+    @classmethod
+    def inject_in_basejinja_body_bottom(cls):
+        """overwrite this method to inject a snippet of code in specter's base.jinja
+        the snippet will be placed at the top of the body-section
+        a typical implementation would be something like:
+        return render_template("myext/inject_in_basejinja_body_bottom.jinja")
+        """
+        pass
+
+
+class Service(Extension):
+    """Deprecated! You should derive from Extension!
+    This is only here for backwards compatibility and will be removed after some time
+    """
+
+    pass

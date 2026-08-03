@@ -1,7 +1,6 @@
 import hashlib
 
 # from ..device import Device
-from . import DeviceTypes
 from .coldcard import ColdCard
 from hwilib.psbt import PSBT
 from binascii import a2b_base64
@@ -11,9 +10,9 @@ from ..helpers import to_ascii20
 
 
 class Cobo(ColdCard):
-    device_type = DeviceTypes.COBO
+    device_type = "cobo"
     name = "Cobo Vault"
-    icon = "cobo_icon.svg"
+    icon = "img/devices/cobo_icon.svg"
 
     hwi_support = False
     sd_card_support = True

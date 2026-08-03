@@ -1,11 +1,11 @@
 """ Stuff to control a bitcoind-instance.
 """
+
 import atexit
 import json
 import logging
 import os
 import platform
-import re
 import shutil
 import signal
 import subprocess
@@ -19,7 +19,11 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from ..helpers import load_jsons
 from ..rpc import BitcoinRPC, RpcError
-from ..specter_error import ExtProcTimeoutException, SpecterError
+from ..specter_error import (
+    ExtProcTimeoutException,
+    SpecterError,
+    BrokenCoreConnectionException,
+)
 from ..util.shell import get_last_lines_from_file, which
 
 logger = logging.getLogger(__name__)
@@ -44,8 +48,8 @@ class Btcd_conn:
 
     @property
     def ipaddress(self):
-        if self._ipaddress == None:
-            raise Exception("ipadress is none")
+        if self._ipaddress is None:
+            raise Exception("ip_address is none")
         else:
             return self._ipaddress
 
@@ -69,7 +73,7 @@ class Btcd_conn:
         return rpc
 
     def render_url(self, password_mask=False):
-        if password_mask == True:
+        if password_mask is True:
             password = "xxxxxx"
         else:
             password = self.rpcpassword
@@ -107,20 +111,16 @@ class NodeController:
         rpcuser="bitcoin",
         rpcpassword="secret",
     ):
-        try:
-            self.rpcconn = Btcd_conn(
-                node_impl=node_impl,
-                rpcuser=rpcuser,
-                rpcpassword=rpcpassword,
-                rpcport=rpcport,
-            )
-            self.network = network
-            self.node_impl = node_impl
-            # reasonable default
-            self.cleanup_hard = False
-        except Exception as e:
-            logger.exception(f"Failed to instantiate BitcoindController. Error: {e}")
-            raise e
+        self.rpcconn = Btcd_conn(
+            node_impl=node_impl,
+            rpcuser=rpcuser,
+            rpcpassword=rpcpassword,
+            rpcport=rpcport,
+        )
+        self.network = network
+        self.node_impl = node_impl
+        # reasonable default
+        self.cleanup_hard = False
 
     def start_node(
         self,
@@ -226,7 +226,7 @@ class NodeController:
 
     def mine(self, address=None, block_count=1):
         """Does mining to the attached address with as many as block_count blocks"""
-        if address == None:
+        if address is None:
             if self.node_impl == "bitcoin":
                 address = "mruae2834buqxk77oaVpephnA5ZAxNNJ1r"
             else:
@@ -263,20 +263,29 @@ class NodeController:
             rpc.generatetoaddress(102, default_address)
             btc_balance = default_rpc.getbalance()
 
-        default_rpc.sendtoaddress(address, amount)
+        result = default_rpc.sendtoaddress(address, amount)
         if confirm_payment:
             # confirm it
             rpc.generatetoaddress(1, default_address)
+        return result
 
     @staticmethod
     def check_node(rpcconn, raise_exception=False):
         """returns true if bitcoind is running on that address/port"""
         if raise_exception:
-            rpcconn.get_rpc()  # that call will also check the connection
-            return True
+            rpc = rpcconn.get_rpc()  # that call will also check the connection
+            if (
+                rpc
+            ):  # if-else is just in case, ideally, rpc should not be returned as None
+                return True
+            return False
         try:
-            rpcconn.get_rpc()  # that call will also check the connection
-            return True
+            rpc = rpcconn.get_rpc()  # that call will also check the connection
+            if (
+                rpc
+            ):  # if-else is just in case, ideally, rpc should not be returned as None
+                return True
+            return False
         except RpcError as e:
             # E.g. "Loading Index ..." #ToDo: check it here
             return False
@@ -288,10 +297,14 @@ class NodeController:
             return False
         except NewConnectionError as e:
             return False
+        except BrokenCoreConnectionException:
+            return False
         except Exception as e:
             # We should avoid this:
             # If you see it in the logs, catch that new exception above
-            logger.error("Unexpected Exception, THIS SHOULD NOT HAPPEN " + str(type(e)))
+            logger.exception(
+                "Unexpected Exception, THIS SHOULD NOT HAPPEN " + str(type(e))
+            )
             logger.debug(f"could not reach bitcoind - message returned: {e}")
             return False
 
@@ -345,17 +358,14 @@ class NodeController:
         if network != "mainnet" and network != "main":
             btcd_cmd += " -{} ".format(network)
         btcd_cmd += " -fallbackfee=0.0002 "
-        btcd_cmd += " -port={} -rpcport={} -rpcbind=0.0.0.0 -rpcbind=0.0.0.0".format(
-            rpcconn.rpcport - 1, rpcconn.rpcport
-        )
+        btcd_cmd += " -port={} -rpcport={}".format(rpcconn.rpcport - 1, rpcconn.rpcport)
         btcd_cmd += " -rpcuser={} -rpcpassword={} ".format(
             rpcconn.rpcuser, rpcconn.rpcpassword
         )
-        btcd_cmd += " -rpcallowip=0.0.0.0/0 -rpcallowip=172.17.0.0/16 "
         if not run_docker:
             if not log_stdout:
                 btcd_cmd += " -noprinttoconsole"
-            if datadir == None:
+            if datadir is None:
                 datadir = tempfile.mkdtemp(prefix="bitcoind_datadir")
             btcd_cmd += ' -datadir="{}" '.format(datadir)
         if extra_args:
@@ -399,7 +409,7 @@ class NodePlainController(NodeController):
         log_stdout=False,
         extra_args=[],
     ):
-        if datadir == None:
+        if datadir is None:
             datadir = tempfile.mkdtemp(
                 prefix=f"specter_{self.node_impl}_regtest_plain_datadir_"
             )
@@ -471,7 +481,7 @@ class NodePlainController(NodeController):
         if not hasattr(self, "datadir"):
             self.datadir = None
 
-        if cleanup_hard == None:
+        if cleanup_hard is None:
             cleanup_hard = self.cleanup_hard
         if not hasattr(self, "node_proc"):
             logger.info("node process was not running")
@@ -555,18 +565,29 @@ def find_node_executable(node_impl):
         return which(f"{node_impl}d")
 
 
-def fetch_wallet_addresses_for_mining(node_impl, data_folder):
-    """parses all the wallet-jsons in the folder (default ~/.specter/wallets/regtest)
-    and returns an array with the addresses
+def fetch_wallet_addresses_for_mining(node_impl, data_folder, exception=None):
     """
-    wallet_folder = (
-        f"{data_folder}/wallets/{'regtest' if node_impl == 'bitcoin' else 'elreg'}"
-    )
-    wallets = load_jsons(wallet_folder)
-    address_array = [value["address"] for key, value in wallets.items()]
-    # remove duplicates
-    address_array = list(dict.fromkeys(address_array))
-    logger.debug(
-        f"Found {len(address_array)} addresses in {len(wallets.items())} wallets located in {wallet_folder}"
-    )
-    return address_array
+    Parses all the wallet jsons in the folder (default ~/.specter/wallets/regtest) and returns an array with the addresses.
+    Pass a wallet name via the exception argument so that this wallet's addresses are not included.
+    """
+    addresses_all = []
+    for folder in [
+        folder for folder in os.listdir(data_folder) if folder.startswith("wallets")
+    ]:
+        wallet_folder = (
+            f"{data_folder}/{folder}/{'regtest' if node_impl == 'bitcoin' else 'elreg'}"
+        )
+        wallets = load_jsons(wallet_folder)
+        if exception and exception in wallets:
+            print(
+                f"Deleting wallet {exception} from wallets that receive faucet coins in testing."
+            )
+            del wallets[exception]
+        address_array = [value["address"] for key, value in wallets.items()]
+        # remove duplicates
+        address_array = list(dict.fromkeys(address_array))
+        logger.debug(
+            f"Found {len(address_array)} addresses in {len(wallets.items())} wallets located in {wallet_folder}"
+        )
+        addresses_all.extend(address_array)
+    return addresses_all

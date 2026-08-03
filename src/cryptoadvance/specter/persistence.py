@@ -13,12 +13,80 @@ import threading
 
 from flask import current_app as app
 
-from .specter_error import SpecterError
+from cryptoadvance.specter.util.reflection import get_class
+
+from .specter_error import SpecterError, SpecterInternalException
+from .services.callbacks import specter_persistence_callback
 from .util.shell import run_shell
 
 logger = logging.getLogger(__name__)
 
 fslock = threading.Lock()
+pclock = threading.Lock()
+
+
+class PersistentObject:
+    """An object which contains reasonable infrastructure to get un-/persisted (in json)
+    As such, other than the name implies, it doesn't contain any business specific attributes
+    Its usage is not (yet?!) supported in this persistence module but let's see
+    """
+
+    @property
+    def fqcn(self):
+        """the fully qualified class Name, e.g. "cryptoadvance.specter.node.Node"""
+        return f"{self.__class__.__module__}.{self.__class__.__name__}"
+
+    @property
+    def json(self):
+        """A property to easily transform your BO to a dict. Use it like:
+        mybo_json = super().json
+        return deep_update(
+            mybo_json,
+            {
+                "name": self.name,
+                "alias": self.alias,
+                [...]
+            },
+        )
+
+        """
+        self_json = {}
+        self_json["python_class"] = self.fqcn
+        if hasattr(self, "fullpath"):
+            self_json["fullpath"] = self.fullpath
+        return self_json
+
+    @property
+    def is_specter_core_object(self):
+        """Whether the class is defined in cryptoadvance.specter"""
+        return self.fqcn.startswith("cryptoadvance.specter.")
+
+    @property
+    def ext_id(self):
+        """returns the third part of yourorg.specterext.ext_id"""
+        if self.is_specter_core_object:
+            return None
+        else:
+            return self.fqcn.split(".")[2]
+
+    @property
+    def blueprint(self):
+        """returns the blueprint of the extension (assuming there is only a default one)"""
+        if self.is_specter_core_object:
+            return ""
+        else:
+            return f"{self.ext_id}_endpoint"
+
+    @classmethod
+    def from_json(cls, a_dict, *args, **kwargs):
+        """Creates a PersistentObject of the right class
+        Might throw a SpecterInternalException
+        """
+        try:
+            clazz = get_class(a_dict["python_class"])
+        except KeyError:
+            raise SpecterInternalException("dict does not have a python_class")
+        return clazz.from_json(a_dict, *args, **kwargs)
 
 
 def read_json_file(path):
@@ -33,8 +101,8 @@ def read_json_file(path):
 
         # if failed - try reading from the backup
         except Exception as e:
-            logger.error(
-                f"Exception {e} while reading file {path}. Reading from backup"
+            logger.exception(
+                f"Exception {e} while reading file {path}. Reading from backup", e
             )
             # if no backup exists - raise
             if not os.path.isfile(bkp):
@@ -53,8 +121,7 @@ def read_json_file(path):
 def _delete_folder(path):
     """Internal method which won't trigger the callback"""
     with fslock:
-        if os.path.exists(path):
-            shutil.rmtree(path)
+        shutil.rmtree(path, ignore_errors=True)  # might not exist
 
 
 def _write_json_file(content, path, lock=None):
@@ -76,17 +143,17 @@ def _write_json_file(content, path, lock=None):
             with open(path, "w") as f:
                 json.dump(content, f, indent=4)
 
-            # check if write was sucessful
+            # check if write was successful
             with open(path, "r") as f:
                 c = json.load(f)
 
         # if not - move back backup
         except Exception as e:
+            logger.exception(e)
             # remove damaged file
             if os.path.isfile(path):
                 os.remove(path)
             shutil.copyfile(bkp, path)
-            logger.exception(e)
             raise SpecterError(
                 f"Error:{path} could not be saved. The old version has been restored. Check the logs for details. This is probably a bug."
             )
@@ -183,15 +250,16 @@ def read_csv(fname, cls=dict, *args):
 
 def storage_callback_function(cmd_list):
     """This is executing the callback-script, either directly or via threading"""
-    logger.debug(f"Executing {cmd_list}")
-    result = run_shell(cmd_list)
-    if result["code"] != 0:
-        logger.error("callback failed ")
-        logger.error("stderr: {}".format(result["err"]))
-        logger.error("stdout: {}".format(result["out"]))
-    else:
-        logger.info("Successfully executed {}".format(" ".join(cmd_list)))
-        logger.debug("result: {}".format(result))
+    with pclock:
+        logger.debug(f"Executing {cmd_list}")
+        result = run_shell(cmd_list)
+        if result["code"] != 0:
+            logger.error("callback failed ")
+            logger.error("stderr: {}".format(result["err"]))
+            logger.error("stdout: {}".format(result["out"]))
+        else:
+            logger.info("Successfully executed {}".format(" ".join(cmd_list)))
+            logger.debug("result: {}".format(result))
 
 
 def storage_callback(mode="write", path=None):
@@ -199,6 +267,27 @@ def storage_callback(mode="write", path=None):
     # Might be usefull to figure out why the callback has been triggered:
     # traceback.print_stack()
     # logger.debug(f"Storage Callback called mode {mode} with path {path}")
+
+    # First, call extensions which want to get informed.
+    # This is working synchronously!
+    try:
+        app.specter.service_manager.execute_ext_callbacks(
+            specter_persistence_callback, path=path, mode=mode
+        )
+    except AttributeError as e:
+        # chicken-egg poroblem:
+        if str(e).endswith("object has no attribute 'specter'"):
+            pass
+        else:
+            raise e
+    except RuntimeError as e:
+        if str(e).startswith("Working outside of application context"):
+            # not yet (?!) supported
+            pass
+        else:
+            raise e
+
+    # Now maybe we have async scripts?
     if os.getenv("SPECTER_PERSISTENCE_CALLBACK_ASYNC"):
         cmd_list = os.getenv("SPECTER_PERSISTENCE_CALLBACK_ASYNC").split(" ")
         cmd_list.append(mode)
@@ -208,6 +297,7 @@ def storage_callback(mode="write", path=None):
             args=(cmd_list,),
         )
         t.start()
+    # Or maybe even synchronous scripts?
     elif os.getenv("SPECTER_PERSISTENCE_CALLBACK"):
         cmd_list = os.getenv("SPECTER_PERSISTENCE_CALLBACK").split(" ")
         cmd_list.append(mode)

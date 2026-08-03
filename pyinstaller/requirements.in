@@ -1,5 +1,5 @@
-pyinstaller==4.9
-pefile
+pyinstaller==6.11.1
+setuptools>=78.1.1
+pefile==2022.5.30
 macholib
 pywin32-ctypes
-babel

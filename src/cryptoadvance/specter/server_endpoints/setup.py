@@ -14,7 +14,7 @@ from flask import render_template, request
 from flask_babel import lazy_gettext as _
 from flask_login import login_required
 
-from ..helpers import alias
+from ..helpers import create_unique_id
 from ..util.bitcoind_setup_tasks import (
     setup_bitcoind_directory_thread,
     setup_bitcoind_thread,
@@ -23,10 +23,11 @@ from ..util.tor_setup_tasks import setup_tor_thread
 
 logger = logging.getLogger(__name__)
 
-rand = random.randint(0, 1e32)  # to force style refresh
+rand = random.randint(0, int(1e32))  # to force style refresh
 
 # Setup endpoint blueprint
 setup_endpoint = Blueprint("setup_endpoint", __name__)
+
 
 ######################### Setup pages #######################################
 @setup_endpoint.route("/start/", methods=["GET"])
@@ -161,7 +162,7 @@ def setup_bitcoind_datadir():
     network = request.form.get("network", "main")
     node_name = "Specter Bitcoin" if network == "main" else f"Specter {network.title()}"
     i = 1
-    while node_name in app.specter.node_manager.nodes:
+    while node_name in app.specter.node_manager.nodes_names:
         i += 1
         node_name = (
             f"Specter Bitcoin {i}"
@@ -169,7 +170,8 @@ def setup_bitcoind_datadir():
             else f"Specter {network.title()} {i}"
         )
     node_default_datadir = os.path.join(
-        app.specter.node_manager.data_folder, f"{alias(node_name)}/.bitcoin-{network}"
+        app.specter.node_manager.data_folder,
+        f"{create_unique_id(node_name)}/.bitcoin-{network}",
     )
     user_selected_datadir = request.form.get(
         "bitcoin_core_datadir", node_default_datadir

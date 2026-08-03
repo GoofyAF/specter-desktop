@@ -1,37 +1,43 @@
 
 describe('Completely empty specter-home', () => {
-  beforeEach(() => {
+  before(() => {
     cy.task("clear:specter-home")
+    cy.visit('/welcome/about')
   })
-  it('Visits specter and clicks around', () => {
-    cy.viewport(1200,660)
-    cy.visit('/')
-    cy.contains('Welcome to Specter Desktop')
-    cy.get('#node-switch-icon').click()
-    cy.get('[href="/nodes/node/default/"]').first().click()
-    cy.contains('Bitcoin Core')
-    cy.get('[href="/settings/"] > img').click()
+
+  it('Click around on the welcome page', () => {
+    cy.contains('Welcome to Specter')
+    cy.get('[data-cy="settings-btn"]').click()
     cy.contains('Backup and Restore')
-    cy.get('[href="/settings/auth"]').click()
-    cy.contains('Authentication:')
-    cy.get('[href="/settings/hwi"]').click()
+    cy.contains('Authentication').click()
+    cy.contains('USB Devices').click()
     cy.contains('Hardware Devices Bridge')
-    // Hidden in Cypress behind the price 
-    // cy.get('[href="/settings/tor"]').click()
-    // cy.contains('Tor configurations')
+    cy.get('main').scrollTo('top')
+    cy.contains('Tor').click()
+    cy.contains('Tor configurations')
+    cy.get('#btn_plugins').click()
+    cy.contains("Plugins in Production")
   })
 
-  it('Creates a device in Specter', () => {
-    cy.viewport(1200,660)
-    cy.visit('/')
-    cy.addDevice("Some Device")
+  it('Setup password protection', () => {
+    cy.get('[data-cy="settings-btn"]').click()
+    cy.contains('Authentication').click()
+    cy.get('[data-cy="authentication-selection"]').select('Password Protection')
+    cy.get('[data-cy="admin-password-input"]').type('satoshi')
+    cy.get('[data-cy="save-auth-settings-btn"]').click()
+    cy.contains('Admin password successfully updated')
   })
 
-  it('Dummytest to enforce remove of device', () => {
-    cy.viewport(1200,660)
-    cy.visit('/')
+  it('Login with password and deactivate password protection again', () => {
+    cy.get('[data-cy="admin-password"]').type('satoshi')
+    cy.get('[data-cy="login-btn"]').click()
+    cy.get('[data-cy="settings-btn"]').click()
+    cy.contains('Authentication').click()
+    cy.get('[data-cy="authentication-selection"]').select('None')
+    cy.get('[data-cy="save-auth-settings-btn"]').click()
   })
 })
+
 
 
 

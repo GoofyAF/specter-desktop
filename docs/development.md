@@ -5,11 +5,16 @@
 - [Development](#development)
   - [How to run the Application](#how-to-run-the-application)
     - [Install dependencies:](#install-dependencies)
-      - [Ubuntu/Debian/macOS](#ubuntudebianmacos)
+      - [Ubuntu/Debian:](#ubuntudebian)
+      - [macOS:](#macos)
+      - [Nix:](#nix)
+      - [Arch:](#arch)
+      - [Fedora/CentOS:](#fedoracentos)
       - [Windows](#windows)
     - [Set up virtualenv](#set-up-virtualenv)
       - [If `pip install` fails on `cryptography==3.4.x`](#if-pip-install-fails-on-cryptography34x)
   - [How to run the tests](#how-to-run-the-tests)
+    - [Hardware-attended Jade tests](#hardware-attended-jade-tests)
   - [Code-Style](#code-style)
   - [Developing on tests](#developing-on-tests)
     - [bitcoin-specific stuff](#bitcoin-specific-stuff)
@@ -30,6 +35,7 @@
     - [Some words about dependencies](#some-words-about-dependencies)
     - [Some words specific to the frontend](#some-words-specific-to-the-frontend)
     - [Some words about style](#some-words-about-style)
+    - [Troubleshooting and migration to python3.10](#troubleshooting-and-migration-to-python310)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -39,16 +45,28 @@
 
 ### Install dependencies:
 
-#### Ubuntu/Debian/macOS
+#### Ubuntu/Debian:
 ```
 sudo apt install libusb-1.0-0-dev libudev-dev libffi-dev libssl-dev build-essential
-
-# macOS:
+```
+#### macOS:
+```
 brew install libusb
+```
+#### Nix:
+The easiest way to get all necessary tools is to run `nix-shell` from the `utils` directory of this repository. You need to have [Nix](https://nixos.org/) installed.
+#### Arch: 
+```
+sudo pacman -Syu && sudo pacman -S libusb
+```
+#### Fedora/CentOS:
+```
+sudo yum -y install libusb libudev-devel libffi libffi-devel openssl-devel && sudo yum groupinstall "Development Tools" "Development Libraries"
+
 ```
 
 #### Windows
-* Install python 3.8.x by downloading from [python.org](https://www.python.org/downloads/windows/)
+* Install python 3.10.x by downloading from [python.org](https://www.python.org/downloads/windows/)
 
     _Do NOT install python from the Microsoft Store! It runs in a different execution environment that creates enormous headaches!_
 
@@ -68,7 +86,7 @@ brew install libusb
 
 
 ### Set up virtualenv
-Note that `hwi-1.2.0` needs Python 3.6-3.8. If you have Python 3.9 installed then be sure to also install an old Python version and pass it to `virtualenv` (e.g. `virtualenv --python3.8 .env`).
+Specter is using `hwi-2.1.0` which by now supports higher Python versions than Specter itself. Specter currently supports Python 3.9 and 3.10.
 
 ```sh
 git clone https://github.com/cryptoadvance/specter-desktop.git
@@ -77,8 +95,7 @@ pip3 install virtualenv
 virtualenv --python=python3 .env 
 source .env/bin/activate
 pip3 install -r requirements.txt --require-hashes
-pip3 install -e .
-python3 setup.py install # also compiles the babel translation-files
+pip3 install -e . # this does not compile the babel translation-files
 ```
 
 _note: invoking commands in the Windows PowerShell is slightly different:_
@@ -96,6 +113,7 @@ Run the server:
 cd specter-desktop
 python3 -m cryptoadvance.specter server --config DevelopmentConfig --debug
 ```
+After that, Specter will be available at http://127.0.0.1:25441/.
 
 #### If `pip install` fails on `cryptography==3.4.x`
 
@@ -120,18 +138,30 @@ _note: you may need to add `$HOME/.cargo/bin` to your path in `.env/bin/activate
 ## How to run the tests
 _TODO: Need more thorough tests!_
 
-In order to run the tests, you need bitcoind and elementsd binaries available. For Linux/Mac, there is some support for installing/compiling them. So you can:
+In order to run the tests, you need bitcoind and elementsd binaries available. For Linux/Mac, there is some support for installing/compiling them. 
+
+For bitcoind you can do:
+
 * `./tests/install_noded.sh --bitcoin binary` will install bitcoind in tests/bitcoin
+
+or:
+
 * `./tests/install_noded.sh --bitcoin compile` will compile bitcoind in tests/bitcoin
+
+For elementsd:
+
 * `./tests/install_noded.sh --elements compile` will compile elements in tests/elements
 
 If you're not interested in elements, you can skip the liquid specific tests as described below.
 
 Set up the dependencies:
 ```sh
-pip3 install -r test_requirements.txt
+pip3 install -e ".[test]"
 pip3 install -e .
 ```
+  
+You need a virtual environment based on Python 3.10 for the tests to run successfully, otherwise you get this error:
+`TypeError: __init__() got an unexpected keyword argument 'ignore_cleanup_errors'`
 
 If you have a local bitcoind already installed:
 ```
@@ -142,13 +172,13 @@ pytest
 OR run against bitcoind in Docker (deprecated):
 ```
 # Pull the bitcoind image if you haven't already:
-docker pull registry.gitlab.com/cryptoadvance/specter-desktop/python-bitcoind:v0.20.1
+docker pull registry.gitlab.com/cryptoadvance/specter-desktop/python-bitcoind:v0.22.0
 
 # install prerequisites
 pip3 install docker
 
-# Run all the tests against the docker bitcoind image
-pytest -m "no elm" --docker 
+# Run all the tests but not elm ones
+pytest -m "no elm" 
 ```
 
 Running specific test subsets:
@@ -179,6 +209,36 @@ Print the logging output live to the terminal:
 ```
 pytest --capture=no --log-cli-level=DEBUG
 ```
+
+### Hardware-attended Jade tests
+
+`tests/test_jade_hardware.py` exercises Specter's HWI integration end-to-end against a physical Blockstream Jade. It is gated by `--run-jade-hardware` and skipped by default, so GitHub Actions ignore it without any workflow change.
+
+Run with `-s` so operator prompts reach the terminal:
+```
+pytest --run-jade-hardware tests/test_jade_hardware.py -s
+```
+
+Three tests, increasing operator effort:
+
+| Test | What it does | Operator action |
+|---|---|---|
+| `test_jade_enumerate_via_specter` | `HWIBridge.enumerate()` finds the Jade and returns a fingerprint | Connect Jade, unlock |
+| `test_jade_extract_xpub_via_specter` | Pulls xpub at `m/84h/0h/0h` (mainnet) | Confirm xpub export on device |
+| `test_jade_sign_psbt_via_specter` | Signs a canned testnet PSBT through Specter's sign path | Boot Jade in Temporary Signer mode, scan SeedQR, confirm tx |
+
+The signing test uses the public **BIP-39 abandon vector** (`abandon abandon ... about`) so the PSBT fixture matches anyone's Jade once they load that seed. Setup procedure:
+
+1. Power-cycle the Jade so it shows the boot menu.
+2. Choose **Temporary Signer** -> **Scan SeedQR**.
+3. Display `tests/fixtures/jade_seedqr_abandon.png` (or `cat tests/fixtures/jade_seedqr_abandon.txt` for the ASCII version) and scan it with the Jade camera.
+4. When Jade asks for the network, select **TESTNET**.
+5. Press Enter at the test prompt.
+6. Confirm the transaction on the Jade screen when it pops up (~99,500 sats to a testnet bech32 output, ~99,500 change auto-validated, 1,000 fee).
+
+Temporary Signer state is held in RAM only and wiped on power-cycle/USB-unplug — your real seed is not affected. Expected master fingerprint for the abandon vector is `73c5da0a`; the test fails fast with a clear hint if the loaded seed is wrong.
+
+The fixture PSBT (`tests/fixtures/jade_hardware.psbt`) was generated with embit against m/84'/1'/0'/0/0 of the abandon vector, including a synthetic `non_witness_utxo` so Jade can verify the input amount per the SegWit fee-spoof mitigation.
 
 Get the log-output of bitcoind side by side with the test-output. For sure you will only see the logs if the test fails.
 ```
@@ -211,7 +271,7 @@ it each time it's starting with the genesis-block. This has some implications:
 * Depending on whether you do one or the other, you cannot rely on transactionIDs. So if you run a test standalone twice, you can assert txids but you can't any longer when you run all the tests
 
 ### Cypress UI-testing
-Cypress is just awesome. It's quite easy to create Frontend-tests and it's even recording all tests and you can immediately see how it went. So each test-run, the tests are kept for one day (see the ["artifacts-section"](https://github.com/k9ert/specter-desktop/blob/cypress/.gitlab-ci.yml#L53-L58)) and you can watch them by browsing the artifacts on any gitlab-job-page (right-hand-side marked with "Job artifacts").
+Cypress is just awesome. It's quite easy to create Frontend-tests and it's even recording all tests and you can immediately see how it went. So each test-run, the tests are kept for one day (see the ["artifacts-section"](https://github.com/cryptoadvance/specter-desktop/blob/master/.gitlab-ci.yml) and you can watch them by browsing the artifacts on any gitlab-job-page (right-hand-side marked with "Job artifacts").
 
 Executing the tests is done via `./utils/test-cypress.sh`:
 ```
@@ -224,7 +284,7 @@ Executing the tests is done via `./utils/test-cypress.sh`:
 ```
 The test_specifications which get executed are specified in `cypress.json`.
 
-More details on cypress-testing can be found in [cypress-testing.md](docs/cypress-testing.md).
+More details on cypress-testing can be found in [cypress-testing.md](./cypress-testing.md).
 Make sure to read it. The tooling we created around cypress might be quite helpful in daily development.
 In short, you can do this and the last command will give you a reliable development-environment which is the very same whenever you start it anew:
 ```
@@ -241,7 +301,7 @@ Other than Django, Flask is not opionoated at all. You can do all sorts of thing
 One strange thing which we're doing to get the tests working is forcing the reload of the controller-code (if necessary) [here](https://github.com/cryptoadvance/specter-desktop/blob/master/src/cryptoadvance/specter/server.py#L88-L93).
 
 The if-clause might be quite brittle which would result in very strange 404 in test_controller.
-Check the [archblog](./docs/archblog.md) for a better explanation.
+Check the [archblog](./archblog.md) for a better explanation.
 If Someone could figure out a better way to do that avoiding this strange this ... very welcome.
 
 ## More on the bitcoind requirements
@@ -354,11 +414,9 @@ In order to enable that, you need to activate pytest support by placing a settin
     "python.pythonPath": ".env/bin/python3.7",
     "python.testing.unittestEnabled": false,
     "python.testing.nosetestsEnabled": false,
-    "python.testing.pytestEnabled": true,
-    "python.testing.pytestArgs": ["--docker"]
+    "python.testing.pytestEnabled": true
 }
 ```
-**WARNING**: Make sure to never stop a unittest in between. Simply continue with the test and let it run through. Otherwise the docker-container used for the test won't get cleaned up and your subsequent test-runs will fail with strange issues. If you did that, simply kill the container (```docker ps; docker kill ...```)
 
 More information on python-unit-tests on VS-Code can be found at the [VS-python-documentation](https://code.visualstudio.com/docs/python/testing).
 
@@ -408,7 +466,7 @@ PyCharm already comes with integrated support for pyTest.
 
 To run/debug all tests:
 * Right click on the `<PROJECT_ROOT>/test` folder and execute `Run pytest in tests`
-* Edit the automatically generated run configuration and optionally add the `--docker` argument, change the working directory to your `<PROJECT_ROOT>` directory
+* Edit the automatically generated run configuration, change the working directory to your `<PROJECT_ROOT>` directory
 * Apply, Save & Run again
 
 To run/debug an individual test, open the script and run/debug by clicking the play icon on the left side of the method declaration.
@@ -425,12 +483,12 @@ If you see this to need some improvements, please make it in small steps and exp
 ### Some words about dependencies
 As a quite young project, we don't have many dependencies yet and as a quite secure-aware use-case, we don't even want to have too many dependencies. That's sometimes the reason that we decide to roll our own rather then taking in new dependencies. This is especially true for javascript. We prefer plain javascript over any kind of frameworks.
 
-If you update `requirements.in` you will need to run the following to update `requirements.txt`:
+If you update `requirements.in` you will need to run the code snippet below to generate a new `requirements.txt`. 
+You need `pip-tools`for that. If you get errors, upgrade `pip` and `pip-tools` to their latest versions.
 ```sh
 $ pip-compile --generate-hashes requirements.in
 ```
-
-This is good for both security and reproducibility.
+This approach is good for both security and reproducibility.
 
 ### Some words specific to the frontend
 We're aware that currently the app is not very compatible on different browsers and there is no clear strategy yet on how (and whether at all) to fix that.
@@ -441,4 +499,30 @@ We're aware that currently the app is not very compatible on different browsers 
   * nice orange #F5A623
   * nice blue #4A90E2
 * A designer would probably rant about all these bad choices. Professional help, especially in the frontend, is very much appreciated.
+
+### Troubleshooting and migration to python3.10
+We're currently migrating to python3.10 while alos supporting older versions. This is creating some extra challenges for those that want to run 3.10 but don't have 3.10 available in their standard-package. So here are some hints on how to get that going.
+
+`pyenv` is a great tool to granually install. The [installation](https://github.com/pyenv/pyenv#basic-github-checkout) worked great. However, i don't want to pyenv to screw up my existing python setup. So i only use pyenv if i explicitely do (put that in a script):
+```
+export PYENV_ROOT="$HOME/.pyenv"
+command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+
+echo "    --> now do:omething like:"
+echo "        pyenv shell 3.10.4"
+```
+So i'm using `pyenv shell` but before you install now a 3.10 version via `pyenv install 3.10.4` make sure to install sqlite3:
+```
+sudo apt-get install sqlite3 libbz2-dev 
+```
+If you miss that, you might later have issues while pre-commit-hooks kick in, something like `No module named '_sqlite3`.
+
+Now you can switch your shell to use python 3.10 via `pyenv shell 3.10.4` and after that create your extra virtualenv which uses 3.10:
+```
+python3 -m virtualenv --python=python3.10 .env310
+```
+
+
+
 

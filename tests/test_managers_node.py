@@ -3,9 +3,11 @@ import tempfile
 import time
 import tarfile
 import os
+from unittest.mock import MagicMock
 
 import pytest
 from cryptoadvance.specter.managers.node_manager import NodeManager
+from cryptoadvance.specter.specter_error import SpecterError
 from cryptoadvance.specter.process_controller.bitcoind_controller import (
     BitcoindPlainController,
 )
@@ -14,14 +16,120 @@ from cryptoadvance.specter.process_controller.elementsd_controller import (
 )
 
 
+def test_node_manager_basics(
+    empty_data_folder, node, node_with_different_port, specter_regtest_configured
+):
+    nodes_folder = empty_data_folder + "/nodes"
+    nm = specter_regtest_configured.node_manager
+    # # Load from disk to get the other two nodes
+    assert sorted(list(nm.nodes.keys())) == [
+        "bitcoin_core",
+        "node_with_a_different_port",
+        "standard_node",
+    ]
+    assert nm.nodes_names == [
+        "Standard node",
+        "Node with a different port",
+        "Bitcoin Core",
+    ]
+    nm.load_from_disk(nodes_folder)
+    assert nm.nodes_names == [
+        "Standard node",
+        "Node with a different port",
+        "Bitcoin Core",
+    ]
+    # Checking some standard methods and properties
+    assert nm.get_by_alias("node_with_a_different_port") == nm.get_by_name(
+        "Node with a different port"
+    )
+    default_node = nm.get_by_alias("bitcoin_core")
+    node_with_a_different_port = nm.get_by_alias("node_with_a_different_port")
+    assert nm.active_node == default_node
+    assert specter_regtest_configured.config["active_node_alias"] == "bitcoin_core"
+    # Switching the node via the node manager does not change the active_node_alias in the config, only specter.update_active_node() does
+    nm.switch_node("node_with_a_different_port")
+    assert nm.active_node == node_with_a_different_port
+    assert specter_regtest_configured.config["active_node_alias"] == "bitcoin_core"
+    specter_regtest_configured.update_active_node("node_with_a_different_port")
+    assert (
+        specter_regtest_configured.config["active_node_alias"]
+        == "node_with_a_different_port"
+    )
+    assert nm.active_node == node_with_a_different_port
+    # Deleting a node
+    nm.delete_node(node_with_a_different_port, specter_regtest_configured)
+    assert nm.nodes_names == ["Standard node", "Bitcoin Core"]
+    # Check that with the deletion of the active node the switch to the next node work, the first node in the list, here the Standard node, is switched to
+    assert specter_regtest_configured.config["active_node_alias"] == "standard_node"
+    assert nm._active_node == "standard_node"
+    # Check the error handling
+    with pytest.raises(
+        SpecterError,
+        match="Node with a different port not found, node could not be deleted.",
+    ):
+        nm.delete_node(node_with_a_different_port, specter_regtest_configured)
+    with pytest.raises(
+        SpecterError, match="Node alias node_with_a_different_port does not exist!"
+    ):
+        nm.switch_node("node_with_a_different_port")
+
+
+def test_auto_create_btc_node_from_env(monkeypatch):
+    """Env vars BTC_RPC_* should auto-create a node on fresh install (empty nodes dir)."""
+    monkeypatch.setenv("BTC_RPC_USER", "testuser")
+    monkeypatch.setenv("BTC_RPC_PASSWORD", "testpass")
+    monkeypatch.setenv("BTC_RPC_PORT", "18443")
+    monkeypatch.setenv("BTC_RPC_HOST", "btcnode")
+    monkeypatch.setenv("BTC_RPC_PROTOCOL", "https")
+
+    with tempfile.TemporaryDirectory(
+        prefix="pytest_NodeManager_env_"
+    ) as data_folder:
+        nm = NodeManager(data_folder=data_folder)
+        # Node created
+        assert "bitcoin_core" in nm.nodes
+        node = nm.nodes["bitcoin_core"]
+        assert node.name == "Bitcoin Core"
+        assert node.user == "testuser"
+        assert node.password == "testpass"
+        assert node.port == "18443"
+        assert node.host == "btcnode"
+        assert node.protocol == "https"
+        # Active node set
+        assert nm._active_node == "bitcoin_core"
+        # JSON persisted
+        assert os.path.isfile(os.path.join(data_folder, "bitcoin_core.json"))
+
+        # Second load_from_disk should NOT duplicate (node already exists)
+        nm.load_from_disk(data_folder)
+        assert list(nm.nodes.keys()).count("bitcoin_core") == 1
+
+
+def test_no_auto_create_btc_node_without_env():
+    """Without BTC_RPC_USER, no node should be auto-created."""
+    # Ensure env var is not set (don't use monkeypatch.delenv in case it's absent)
+    old = os.environ.pop("BTC_RPC_USER", None)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="pytest_NodeManager_noenv_"
+        ) as data_folder:
+            nm = NodeManager(data_folder=data_folder)
+            assert len(nm.nodes) == 0
+    finally:
+        if old is not None:
+            os.environ["BTC_RPC_USER"] = old
+
+
 @pytest.mark.elm
-def test_NodeManager(
+def test_switch_nodes_across_chains(
     bitcoin_regtest: BitcoindPlainController, elements_elreg: ElementsPlainController
 ):
-    with tempfile.TemporaryDirectory("_some_datafolder_tmp") as data_folder:
+    with tempfile.TemporaryDirectory(
+        prefix="pytest_NodeManager_datafolder"
+    ) as data_folder:
         print(f"data_folder={data_folder}")
         nm = NodeManager(data_folder=data_folder)
-        nm.add_node(
+        nm.add_external_node(
             "BTC",
             "bitcoin_regtest",
             False,
@@ -31,12 +139,11 @@ def test_NodeManager(
             bitcoin_regtest.rpcconn.rpcport,
             bitcoin_regtest.rpcconn._ipaddress,
             "http",
-            external_node=True,
         )
-        assert nm.nodes_names == ["Bitcoin Core", "bitcoin_regtest"]
+        assert nm.nodes_names == ["bitcoin_regtest"]
         nm.switch_node("bitcoin_regtest")
-        assert nm.active_node.get_rpc().getblockchaininfo()["chain"] == "regtest"
-        nm.add_node(
+        assert nm.active_node.rpc.getblockchaininfo()["chain"] == "regtest"
+        nm.add_external_node(
             "ELM",
             "elements_elreg",
             False,
@@ -46,53 +153,7 @@ def test_NodeManager(
             elements_elreg.rpcconn.rpcport,
             elements_elreg.rpcconn._ipaddress,
             "http",
-            external_node=True,
         )
-        assert nm.nodes_names == ["Bitcoin Core", "bitcoin_regtest", "elements_elreg"]
+        assert nm.nodes_names == ["bitcoin_regtest", "elements_elreg"]
         nm.switch_node("elements_elreg")
-        assert nm.active_node.get_rpc().getblockchaininfo()["chain"] == "elreg"
-        time.sleep(20)
-
-
-""" For some reason this breaks other tests"""
-
-
-@pytest.mark.skip()
-def test_NodeManager_import(bitcoind_path):
-    with tempfile.TemporaryDirectory("_some_datafolder_tmp") as data_folder:
-        print(f"data_folder={data_folder}")
-        nm = NodeManager(data_folder=data_folder, bitcoind_path=bitcoind_path)
-        print(os.getcwd())
-        # This .bitcoin folder doesn't have a config-file
-        btc_tar = tarfile.open(
-            "./tests/helpers_testdata/bitcoin_minimum_mainnet_datadir.tgz", "r:gz"
-        )
-        btc_tar.extractall(os.path.join(data_folder, "somename", ".bitcoin-main"))
-        #         # ... so let's create one
-        #         with open(
-        #             os.path.join(data_folder,"somename",".bitcoin-main","bitcoin.conf"),
-        #             "w+",
-        #         ) as file:
-        #             file.write('''
-        # rpcauth=bitcoin:044931c1d498b7c27080d8b981331a65$6ee7929513401c39ca1f7e376e55553c52dcb36a14e8410ac5f514fbf18bedbb
-        # server=1
-        # listen=1
-        # proxy=127.0.0.1:9050
-        # bind=127.0.0.1
-        # torcontrol=127.0.0.1:9051
-        # torpassword=gVzREfuHso6U2OfRRvqT3w
-        # fallbackfee=0.0002
-        # prune=1000
-        #             '''
-        #             )
-
-        node = nm.add_internal_node("somename", port=8339)
-        try:
-            node.start()
-            time.sleep(5)
-            # assert node.get_rpc().password == None
-            nm.switch_node("somename")
-            time.sleep(5)
-            assert nm.active_node.get_rpc().getblockchaininfo()["chain"] == "main"
-        finally:
-            node.stop()
+        assert nm.active_node.rpc.getblockchaininfo()["chain"] == "elreg"

@@ -3,15 +3,19 @@ import code
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import tempfile
 import traceback
 
 import pytest
+
 from cryptoadvance.specter.config import TestConfig
 from cryptoadvance.specter.managers.device_manager import DeviceManager
+from cryptoadvance.specter.managers.node_manager import NodeManager
 from cryptoadvance.specter.managers.user_manager import UserManager
+from cryptoadvance.specter.node import Node
 from cryptoadvance.specter.process_controller.bitcoind_controller import (
     BitcoindPlainController,
 )
@@ -20,7 +24,11 @@ from cryptoadvance.specter.process_controller.elementsd_controller import (
 )
 from cryptoadvance.specter.server import SpecterFlask, create_app, init_app
 from cryptoadvance.specter.specter import Specter
-from cryptoadvance.specter.specter_error import SpecterError
+from cryptoadvance.specter.specter_error import (
+    BrokenCoreConnectionException,
+    SpecterError,
+    handle_exception,
+)
 from cryptoadvance.specter.user import User, hash_password
 from cryptoadvance.specter.util.common import str2bool
 from cryptoadvance.specter.util.shell import which
@@ -28,7 +36,13 @@ from cryptoadvance.specter.util.wallet_importer import WalletImporter
 
 logger = logging.getLogger(__name__)
 
-pytest_plugins = ["ghost_machine"]
+pytest_plugins = [
+    "conftest_visibility",
+    "fix_ghost_machine",
+    "fix_keys_and_seeds",
+    "fix_devices_and_wallets",
+    "fix_testnet",
+]
 
 # This is from https://stackoverflow.com/questions/132058/showing-the-stack-trace-from-a-running-python-application
 # it enables stopping a hanging test via sending the pytest-process a SIGUSR2 (12)
@@ -57,7 +71,6 @@ def pytest_addoption(parser):
     see pytest_generate_tests(metafunc) on how to check that
     Also used to register the SIGUSR2 (12) as decribed in conftest.py
     """
-    parser.addoption("--docker", action="store_true", help="run bitcoind in docker")
     parser.addoption(
         "--bitcoind-version",
         action="store",
@@ -76,7 +89,22 @@ def pytest_addoption(parser):
         default="master",
         help="Version of elementsd (something which works with git checkout ...)",
     )
+    parser.addoption(
+        "--run-jade-hardware",
+        action="store_true",
+        default=False,
+        help="Run tests marked jade_hardware (real Jade attached + operator).",
+    )
     listen()
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-jade-hardware"):
+        return
+    skip = pytest.mark.skip(reason="opt-in via --run-jade-hardware")
+    for item in items:
+        if item.get_closest_marker("jade_hardware") is not None:
+            item.add_marker(skip)
 
 
 def pytest_generate_tests(metafunc):
@@ -90,31 +118,24 @@ def pytest_generate_tests(metafunc):
             metafunc.parametrize("docker", [False], scope="session")
 
 
-def instantiate_bitcoind_controller(docker, request, rpcport=18543, extra_args=[]):
+def instantiate_bitcoind_controller(
+    request, rpcport=18543, extra_args=[]
+) -> BitcoindPlainController:
     # logging.getLogger().setLevel(logging.DEBUG)
     requested_version = request.config.getoption("--bitcoind-version")
     log_stdout = str2bool(request.config.getoption("--bitcoind-log-stdout"))
-    if docker:
-        from cryptoadvance.specter.process_controller.bitcoind_docker_controller import (
-            BitcoindDockerController,
-        )
-
-        bitcoind_controller = BitcoindDockerController(
-            rpcport=rpcport, docker_tag=requested_version
-        )
+    if os.path.isfile("tests/bitcoin/src/bitcoind"):
+        bitcoind_controller = BitcoindPlainController(
+            bitcoind_path="tests/bitcoin/src/bitcoind", rpcport=rpcport
+        )  # always prefer the self-compiled bitcoind if existing
+    elif os.path.isfile("tests/bitcoin/bin/bitcoind"):
+        bitcoind_controller = BitcoindPlainController(
+            bitcoind_path="tests/bitcoin/bin/bitcoind", rpcport=rpcport
+        )  # next take the self-installed binary if existing
     else:
-        if os.path.isfile("tests/bitcoin/src/bitcoind"):
-            bitcoind_controller = BitcoindPlainController(
-                bitcoind_path="tests/bitcoin/src/bitcoind", rpcport=rpcport
-            )  # always prefer the self-compiled bitcoind if existing
-        elif os.path.isfile("tests/bitcoin/bin/bitcoind"):
-            bitcoind_controller = BitcoindPlainController(
-                bitcoind_path="tests/bitcoin/bin/bitcoind", rpcport=rpcport
-            )  # next take the self-installed binary if existing
-        else:
-            bitcoind_controller = BitcoindPlainController(
-                rpcport=rpcport
-            )  # Alternatively take the one on the path for now
+        bitcoind_controller = BitcoindPlainController(
+            rpcport=rpcport
+        )  # Alternatively take the one on the path for now
     bitcoind_controller.start_bitcoind(
         cleanup_at_exit=True,
         cleanup_hard=True,
@@ -125,7 +146,7 @@ def instantiate_bitcoind_controller(docker, request, rpcport=18543, extra_args=[
     running_version = bitcoind_controller.version()
     requested_version = request.config.getoption("--bitcoind-version")
     assert running_version == requested_version, (
-        "Please make sure that the Bitcoind-version (%s) matches with the version in pytest.ini (%s)"
+        "Please make sure that the Bitcoind-version (%s) matches with the version in pyproject.toml (%s)"
         % (running_version, requested_version)
     )
     return bitcoind_controller
@@ -151,7 +172,7 @@ def instantiate_elementsd_controller(request, rpcport=18643, extra_args=[]):
     running_version = elementsd_controller.version()
     requested_version = request.config.getoption("--elementsd-version")
     assert running_version == requested_version, (
-        "Please make sure that the elementsd-version (%s) matches with the version in pytest.ini (%s)"
+        "Please make sure that the elementsd-version (%s) matches with the version in pyproject.toml (%s)"
         % (running_version, requested_version)
     )
     return elementsd_controller
@@ -174,14 +195,91 @@ def bitcoind_path():
 
 
 @pytest.fixture(scope="session")
-def bitcoin_regtest(docker, request):
-    bitcoind_regtest = instantiate_bitcoind_controller(docker, request, extra_args=None)
+def bitcoin_regtest(request) -> BitcoindPlainController:
+    bitcoind_regtest = instantiate_bitcoind_controller(request, extra_args=None)
+    try:
+        assert bitcoind_regtest.get_rpc().test_connection()
+        assert not bitcoind_regtest.datadir is None
+        assert bitcoind_regtest.datadir is not ""
+        yield bitcoind_regtest
+    finally:
+        bitcoind_regtest.stop_bitcoind()
+
+
+@pytest.fixture(scope="session")
+def bitcoin_regtest2(request) -> BitcoindPlainController:
+    """If a test needs two nodes ..."""
+    bitcoind_regtest = instantiate_bitcoind_controller(
+        request, rpcport=18545, extra_args=None
+    )
     try:
         assert bitcoind_regtest.get_rpc().test_connection()
         assert not bitcoind_regtest.datadir is None
         yield bitcoind_regtest
     finally:
         bitcoind_regtest.stop_bitcoind()
+
+
+@pytest.fixture
+def node(empty_data_folder, bitcoin_regtest):
+    nodes_folder = empty_data_folder + "/nodes"
+    if not os.path.isdir(nodes_folder):
+        os.makedirs(nodes_folder)
+    nm = NodeManager(data_folder=nodes_folder)
+    node: Node = nm.add_external_node(
+        "BTC",
+        "Standard node",
+        False,
+        bitcoin_regtest.datadir,
+        bitcoin_regtest.rpcconn.rpcuser,
+        bitcoin_regtest.rpcconn.rpcpassword,
+        bitcoin_regtest.rpcconn.rpcport,
+        bitcoin_regtest.rpcconn._ipaddress,
+        "http",
+    )
+    assert node.rpc.test_connection()
+    return node
+
+
+@pytest.fixture
+def node_with_different_port(empty_data_folder, bitcoin_regtest):
+    nodes_folder = empty_data_folder + "/nodes"
+    if not os.path.isdir(nodes_folder):
+        os.makedirs(nodes_folder)
+    nm = NodeManager(data_folder=nodes_folder)
+    node = nm.add_external_node(
+        "BTC",
+        "Node with a different port",
+        False,
+        "",
+        bitcoin_regtest.rpcconn.rpcuser,
+        bitcoin_regtest.rpcconn.rpcpassword,
+        18333,
+        bitcoin_regtest.rpcconn._ipaddress,
+        "http",
+    )
+    return node
+
+
+@pytest.fixture
+def node_with_empty_datadir(empty_data_folder, bitcoin_regtest):
+    nodes_folder = empty_data_folder + "/nodes"
+    if not os.path.isdir(nodes_folder):
+        os.makedirs(nodes_folder)
+    node = Node.from_json(
+        {
+            "autodetect": False,
+            "datadir": "",
+            "user": bitcoin_regtest.rpcconn.rpcuser,
+            "password": bitcoin_regtest.rpcconn.rpcpassword,
+            "port": bitcoin_regtest.rpcconn.rpcport,
+            "host": bitcoin_regtest.rpcconn.ipaddress,
+            "protocol": "http",
+        },
+        manager=NodeManager(data_folder=nodes_folder),
+        default_fullpath=os.path.join(nodes_folder, "node_with_empty_datadir.json"),
+    )
+    return node
 
 
 @pytest.fixture(scope="session")
@@ -197,138 +295,32 @@ def elements_elreg(request):
 @pytest.fixture
 def empty_data_folder():
     # Make sure that this folder never ever gets a reasonable non-testing use-case
-    with tempfile.TemporaryDirectory(prefix="specter_home_tmp_") as data_folder:
+    with tempfile.TemporaryDirectory(
+        prefix="specter_home_tmp_", ignore_cleanup_errors=False
+    ) as data_folder:
         yield data_folder
 
 
 @pytest.fixture
 def devices_filled_data_folder(empty_data_folder):
-    os.makedirs(empty_data_folder + "/devices")
-    with open(empty_data_folder + "/devices/trezor.json", "w") as text_file:
-        text_file.write(
-            """
-{
-    "name": "Trezor",
-    "type": "trezor",
-    "keys": [
-        {
-            "derivation": "m/49h/0h/0h",
-            "original": "ypub6XFn7hfb676MLm6ZsAviuQKXeRDNgT9Bs32KpRDPnkKgKDjKcrhYCXJ88aBfy8co2k9eujugJX5nwq7RPG4sj6yncDEPWN9dQGmFWPy4kFB",
-            "fingerprint": "1ef4e492",
-            "type": "sh-wpkh",
-            "xpub": "xpub6CRWp2zfwRYsVTuT2p96hKE2UT4vjq9gwvW732KWQjwoG7v6NCXyaTdz7NE5yDxsd72rAGK7qrjF4YVrfZervsJBjsXxvTL98Yhc7poBk7K"
-        },
-        {
-            "derivation": "m/84h/0h/0h",
-            "original": "zpub6rGoJTXEhKw7hUFkjMqNctTzojkzRPa3VFuUWAirqpuj13mRweRmnYpGD1aQVFpxNfp17zVU9r7F6oR3c4zL3DjXHdewVvA7kjugHSqz5au",
-            "fingerprint": "1ef4e492",
-            "type": "wpkh",
-            "xpub": "xpub6CcGh8BQPxr9zssX4eG8CiGzToU6Y9b3f2s2wNw65p9xtr8ySL6eYRVzAbfEVSX7ZPaPd3JMEXQ9LEBvAgAJSkNKYxG6L6X9DHnPWNQud4H"
-        },
-        {
-            "derivation": "m/48h/0h/0h/1h",
-            "original": "Ypub6jtWQ1r2D7EwqNoxERU28MWZH4WdL3pWdN8guFJRBTmGwstJGzMXJe1VaNZEuAAVsZwpKPhs5GzNPEZR77mmX1mjwzEiouxmQYsrxFBNVNN",
-            "fingerprint": "1ef4e492",
-            "type": "sh-wsh",
-            "xpub": "xpub6EA9y7SfVU96ZWTTTQDR6C5FPJKvB59RPyxoCb8zRgYzGbWAFvogbTVRkTeBLpHgETm2hL7BjQFKNnL66CCoaHyUFBRtpbgHF6YLyi7fr6m"
-        },
-        {
-            "derivation": "m/48h/0h/0h/2h",
-            "original": "Zpub74imhgWwMnnRkSPkiNavCQtSBu1fGo8RP96h9eT2GHCgN5eFU9mZVPhGphvGnG26A1cwJxtkmbHR6nLeTw4okpCDjZCEj2HRLJoVHAEsch9",
-            "fingerprint": "1ef4e492",
-            "type": "wsh",
-            "xpub": "xpub6EA9y7SfVU96dGr96zYgxAMd8AgWBCTqEeQafbPi8VcWdhStCS4AA9X4yb3dE1VM7GKLwRhWy4BpD3VkjK5q1riMAQgz9oBSu8QKv5S7KzD"
-        },
-        {
-            "derivation": "m/49h/1h/0h",
-            "original": "upub5EKoQv21nQNkhdt4yuLyRnWitA3EGhW1ru1Y8VTG8gdys2JZhqiYkhn4LHp2heHnH41kz95bXPvrYVRuFUrdUMik6YdjFV4uL4EubnesttQ",
-            "fingerprint": "1ef4e492",
-            "type": "sh-wpkh",
-            "xpub": "tpubDDCDr9rSwixeXKeGwAgwFy8bjBaE5wya9sAVqEC4ccXWmcQxY34KmLRJdwmaDsCnHsu5r9P9SUpYtXmCoRwukWDqmAUJgkBbjC2FXUzicn6"
-        },
-        {
-            "derivation": "m/84h/1h/0h",
-            "original": "vpub5Y35MNUT8sUR2SnRCU9A9S6z1JDACMTuNnM8WHXvuS7hCwuVuoRAWJGpi66Yo8evGPiecN26oLqx19xf57mqVQjiYb9hbb4QzbNmFfsS9ko",
-            "fingerprint": "1ef4e492",
-            "type": "wpkh",
-            "xpub": "tpubDC5EUwdy9WWpzqMWKNhVmXdMgMbi4ywxkdysRdNr1MdM4SCfVLbNtsFvzY6WKSuzsaVAitj6FmP6TugPuNT6yKZDLsHrSwMd816TnqX7kuc"
-        },
-        {
-            "derivation": "m/48h/1h/0h/1h",
-            "original": "Upub5Tk9tZtdzVaTGWtygRTKDDmaN5vfB59pn2L5MQyH6BkVpg2Y5J95rtpQndjmXNs3LNFiy8zxpHCTtvxxeePjgipF7moTHQZhe3E5uPzDXh8",
-            "fingerprint": "1ef4e492",
-            "type": "sh-wsh",
-            "xpub": "tpubDFiVCZzdarbyfdVoh2LJDL3eVKRPmxwnkiqN8tSYCLod75a2966anQbjHajqVAZ97j54xZJPr9hf7ogVuNL4pPCfwvXdKGDQ9SjZF7vXQu1"
-        },
-        {
-            "derivation": "m/48h/1h/0h/2h",
-            "original": "Vpub5naRCEZZ9B7wCKLWuqoNdg6ddWEx8ruztUygXFZDJtW5LRMqUP5HV2TsNw1nc74Ba3QPDSH7qzauZ8LdfNmnmofpfmztCGPgP7vaaYSmpgN",
-            "fingerprint": "1ef4e492",
-            "type": "wsh",
-            "xpub": "tpubDFiVCZzdarbyk8kE65tjRhHCambEo8iTx4xkXL8b33BKZj66HWsDnUb3rg4GZz6Mwm6vTNyzRCjYtiScCQJ77ENedb2deDDtcoNQXiUouJQ"
-        }
-    ]
-}
-"""
-        )
-    with open(empty_data_folder + "/devices/specter.json", "w") as text_file:
-        text_file.write(
-            """
-{
-    "name": "Specter",
-    "type": "specter",
-    "keys": [
-        {
-            "derivation": "m/48h/1h/0h/2h",
-            "original": "Vpub5n9kKePTPPGtw3RddeJWJe29epEyBBcoHbbPi5HhpoG2kTVsSCUzsad33RJUt3LktEUUPPofcZczuudnwR7ZgkAkT6N2K2Z7wdyjYrVAkXM",
-            "fingerprint": "08686ac6",
-            "type": "wsh",
-            "xpub": "tpubDFHpKypXq4kwUrqLotPs6fCic5bFqTRGMBaTi9s5YwwGymE8FLGwB2kDXALxqvNwFxB1dLWYBmmeFVjmUSdt2AsaQuPmkyPLBKRZW8BGCiL"
-        },
-        {
-            "derivation": "m/84h/1h/0h",
-            "original": "vpub5ZSem3mLXiSJzgDX6pJb2N9L6sJ8m6ejaksLPLSuB53LBzCi2mMsBg19eEUSDkHtyYp75GATjLgt5p3S43WjaVCXAWU9q9H5GhkwJBrMiAb",
-            "fingerprint": "08686ac6",
-            "type": "wpkh",
-            "xpub": "tpubDDUotcvrYMUiy4ncDirveTfhmvggdj8nxcW5JgHpGzYz3UVscJY5aEzFvgUPk4YyajadBnsTBmE2YZmAtJC14Q21xncJgVaHQ7UdqMRVRbU"
-        },
-        {
-            "derivation": "m/84h/1h/1h",
-            "original": "vpub5ZSem3mLXiSK55jPzfLVhbHbTEwGzEFZv3xrGFCw1vGHSNw7WcVuJXysJLWcgENQd3iXSNQaeSXUBW55Hy4GAjSTjrWP4vpKKkUN9jiU1Tc",
-            "fingerprint": "08686ac6",
-            "type": "wpkh",
-            "xpub": "tpubDDUotcvrYMUj3UJV7ZtqKgoy8JKprrjdHubbBb3r7qmwHsEH69g7h6xyanWaCYdVEEV3Yu7a6s4ceFnp8DjXeeFxY8eXvH7XTAC4gxfDNEW"
-        },
-        {
-            "derivation": "m/84h/1h/2h",
-            "original": "vpub5ZSem3mLXiSK64v64deytnDCoYqbUSYHvmVurUGVMEnXMyEybtF3FEnNuiFDDC6J18a81fv5ptQXaQaaRiYx8MRxahipgxPLdxubpYt1dkD",
-            "fingerprint": "08686ac6",
-            "type": "wpkh",
-            "xpub": "tpubDDUotcvrYMUj4TVBBYDKWsjaUcE9M52MJd8emp7QTAJBDTY9BRRFdomVCAFAjWMNcKLe8Cd5HJwg3AJKFyEDcGFTNyryYJgYmNdJMhwB2RG"
-        },
-        {
-            "derivation": "m/84h/1h/3h",
-            "original": "vpub5ZSem3mLXiSK8cKzh4sHxTvN7mgYQA29HfoAZeCDtX1M2zdejN5XVAtVyqhk8eui18JTtZ9M3VD3AiWCz8VwrybhBUh3HxzS8js3mLVybDT",
-            "fingerprint": "08686ac6",
-            "type": "wpkh",
-            "xpub": "tpubDDUotcvrYMUj6zu5oyRdaZSjnq56GnWCfXRuUz38zSWztUvpJuFjsjscGHhheyAncK4z15rLVukBdUDwpPBDLtRBykqC9KHeG9akJWRipKK"
-        }
-    ]
-}
-"""
-        )
+    devices_folder = empty_data_folder + "/devices"
+    if not os.path.isdir(devices_folder):
+        os.makedirs(devices_folder)
+
+    shutil.copy2(
+        "./tests/misc_testdata/trezor_device.json",
+        empty_data_folder + "/devices/trezor.json",
+    )
+    shutil.copy2(
+        "./tests/misc_testdata/specter_device.json",
+        empty_data_folder + "/devices/specter.json",
+    )
     return empty_data_folder  # no longer empty, though
 
 
 @pytest.fixture
 def wallets_filled_data_folder(devices_filled_data_folder):
-    os.makedirs(os.path.join(devices_filled_data_folder, "wallets", "regtest"))
-    with open(
-        os.path.join(devices_filled_data_folder, "wallets", "regtest", "simple.json"),
-        "w",
-    ) as json_file:
-        json_file.write(
-            """
+    simple_json = """
 {
     "alias": "simple",
     "fullpath": "/home/kim/.specter/wallets/regtest/simple.json",
@@ -354,9 +346,56 @@ def wallets_filled_data_folder(devices_filled_data_folder):
     "device_type": "trezor",
     "address_type": "bech32"
 }
-
 """
-        )
+    another_wallet_json = """
+{
+    "name": "sdsd",
+    "alias": "sdsd",
+    "description": "Single (Segwit)",
+    "address_type": "bech32",
+    "address": "bcrt1q4h86vfanswhsle63hw2muv9h5a45cg2878uez5",
+    "address_index": 0,
+    "change_address": "bcrt1qxsj28ddr95xvp7xjyzkkfq6qknrn4kap30zkut",
+    "change_index": 0,
+    "keypool": 60,
+    "change_keypool": 20,
+    "recv_descriptor": "wpkh([41490ec7/84h/1h/0h]tpubDCTPz7KwyetfhQNMSWiK34pPR2zSTsTybrMPgRVAzouNLqtgsv51o81KjccmTbjkWJ8mVhRJM1LxZD6AfRH2635tHpHeCAKW446iwADNv7C/0/*)#rn833s5g",
+    "change_descriptor": "wpkh([41490ec7/84h/1h/0h]tpubDCTPz7KwyetfhQNMSWiK34pPR2zSTsTybrMPgRVAzouNLqtgsv51o81KjccmTbjkWJ8mVhRJM1LxZD6AfRH2635tHpHeCAKW446iwADNv7C/1/*)#j8zsv9ys",
+    "keys": [
+        {
+            "original": "vpub5YRErYARy1rFj1oGKc9yQyJ1jybtbEyvDziem5eFttPiVMbXJNtoQZ2DTAcowHUfu7NFPAiJtaop6TNRqAbkc8GPVY9VLp2HveP2PygjuYh",
+            "fingerprint": "41490ec7",
+            "derivation": "m/84h/1h/0h",
+            "type": "wpkh",
+            "purpose": "#0 Single Sig (Segwit)",
+            "xpub": "tpubDCTPz7KwyetfhQNMSWiK34pPR2zSTsTybrMPgRVAzouNLqtgsv51o81KjccmTbjkWJ8mVhRJM1LxZD6AfRH2635tHpHeCAKW446iwADNv7C"
+        }
+    ],
+    "devices": [
+        "dsds"
+    ],
+    "sigs_required": 1,
+    "blockheight": 0,
+    "pending_psbts": {},
+    "frozen_utxo": [],
+    "last_block": "187e2db380eb6d901efd87188f00c7074506c9c3813b8ecec7300ecc4e55eb46"
+}
+"""
+
+    os.makedirs(os.path.join(devices_filled_data_folder, "wallets", "regtest"))
+    with open(
+        os.path.join(devices_filled_data_folder, "wallets", "regtest", "simple.json"),
+        "w",
+    ) as json_file:
+        json_file.write(simple_json)
+    os.makedirs(os.path.join(devices_filled_data_folder, "wallets_someuser", "regtest"))
+    with open(
+        os.path.join(
+            devices_filled_data_folder, "wallets_someuser", "regtest", "simple.json"
+        ),
+        "w",
+    ) as json_file:
+        json_file.write(another_wallet_json)
     return devices_filled_data_folder  # and with wallets obviously
 
 
@@ -394,12 +433,12 @@ def device_manager(devices_filled_data_folder):
 
 
 @pytest.fixture
-def specter_regtest_configured(bitcoin_regtest, devices_filled_data_folder):
+def specter_regtest_configured(bitcoin_regtest, devices_filled_data_folder, node):
     assert bitcoin_regtest.get_rpc().test_connection()
     config = {
         "rpc": {
             "autodetect": False,
-            "datadir": "",
+            "datadir": bitcoin_regtest.datadir,
             "user": bitcoin_regtest.rpcconn.rpcuser,
             "password": bitcoin_regtest.rpcconn.rpcpassword,
             "port": bitcoin_regtest.rpcconn.rpcport,
@@ -408,6 +447,65 @@ def specter_regtest_configured(bitcoin_regtest, devices_filled_data_folder):
         },
         "auth": {
             "method": "rpcpasswordaspin",
+        },
+        "testing": {
+            "allow_threading_for_testing": False,
+        },
+    }
+    specter: Specter = Specter(
+        data_folder=devices_filled_data_folder, config=config, checker_threads=False
+    )
+    assert specter.active_node_alias == "bitcoin_core"
+    assert specter.node_manager.active_node.alias == "bitcoin_core"
+    assert specter.chain == "regtest"
+    # Create a User
+    someuser = specter.user_manager.add_user(
+        User.from_json(
+            user_dict={
+                "id": "someuser",
+                "username": "someuser",
+                "password": hash_password("somepassword"),
+                "config": {},
+                "is_admin": False,
+                "services": None,
+            },
+            specter=specter,
+        )
+    )
+    specter.user_manager.save()
+    specter.check()
+
+    assert not specter.wallet_manager.working_folder is None
+    try:
+        yield specter
+    finally:
+        # End all threads
+        # Deleting all Wallets (this will also purge them on core)
+        for user in specter.user_manager.users:
+            for wallet in list(user.wallet_manager.wallets.values()):
+                user.wallet_manager.delete_wallet(wallet, node)
+
+
+@pytest.fixture
+def specter_regtest_configured_with_threading(
+    bitcoin_regtest, devices_filled_data_folder, node
+):
+    assert bitcoin_regtest.get_rpc().test_connection()
+    config = {
+        "rpc": {
+            "autodetect": False,
+            "datadir": bitcoin_regtest.datadir,
+            "user": bitcoin_regtest.rpcconn.rpcuser,
+            "password": bitcoin_regtest.rpcconn.rpcpassword,
+            "port": bitcoin_regtest.rpcconn.rpcport,
+            "host": bitcoin_regtest.rpcconn.ipaddress,
+            "protocol": "http",
+        },
+        "auth": {
+            "method": "rpcpasswordaspin",
+        },
+        "testing": {
+            "allow_threading_for_testing": True,
         },
     }
     specter = Specter(data_folder=devices_filled_data_folder, config=config)
@@ -429,36 +527,6 @@ def specter_regtest_configured(bitcoin_regtest, devices_filled_data_folder):
     specter.user_manager.save()
     specter.check()
 
-    assert not someuser.wallet_manager.working_folder is None
-
-    # Create a Wallet
-    wallet_json = '{"label": "a_simple_wallet", "blockheight": 0, "descriptor": "wpkh([1ef4e492/84h/1h/0h]tpubDC5EUwdy9WWpzqMWKNhVmXdMgMbi4ywxkdysRdNr1MdM4SCfVLbNtsFvzY6WKSuzsaVAitj6FmP6TugPuNT6yKZDLsHrSwMd816TnqX7kuc/0/*)#xp8lv5nr", "devices": [{"type": "trezor", "label": "trezor"}]} '
-    wallet_importer = WalletImporter(
-        wallet_json, specter, device_manager=someuser.device_manager
-    )
-    wallet_importer.create_nonexisting_signers(
-        someuser.device_manager,
-        {"unknown_cosigner_0_name": "trezor", "unknown_cosigner_0_type": "trezor"},
-    )
-    dm: DeviceManager = someuser.device_manager
-    wallet = wallet_importer.create_wallet(someuser.wallet_manager)
-    try:
-        # fund it with some coins
-        bitcoin_regtest.testcoin_faucet(address=wallet.getnewaddress())
-        # make sure it's confirmed
-        bitcoin_regtest.mine()
-        # Realize that the wallet has funds:
-        wallet.update()
-    except SpecterError as se:
-        if str(se).startswith("Timeout"):
-            pytest.fail(
-                "We got a Bitcoin-RPC timeout while setting up the test, minting some coins. Test Error! Check cpu/mem utilastion and btc/elem logs!"
-            )
-            return
-        else:
-            raise se
-
-    assert wallet.fullbalance >= 20
     assert not specter.wallet_manager.working_folder is None
     try:
         yield specter
@@ -466,15 +534,11 @@ def specter_regtest_configured(bitcoin_regtest, devices_filled_data_folder):
         # Deleting all Wallets (this will also purge them on core)
         for user in specter.user_manager.users:
             for wallet in list(user.wallet_manager.wallets.values()):
-                user.wallet_manager.delete_wallet(
-                    wallet, bitcoin_datadir=bitcoin_regtest.datadir, chain="regtest"
-                )
+                user.wallet_manager.delete_wallet(wallet, node)
 
 
 def specter_app_with_config(config={}, specter=None):
     """helper-function to create SpecterFlasks"""
-    if specter == None:
-        specter = Specter()
     if isinstance(config, dict):
         tempClass = type("tempClass", (TestConfig,), {})
         for key, value in config.items():
@@ -508,7 +572,7 @@ def app(specter_regtest_configured) -> SpecterFlask:
 
 @pytest.fixture
 def app_no_node(empty_data_folder) -> SpecterFlask:
-    specter = Specter(data_folder=empty_data_folder)
+    specter = Specter(data_folder=empty_data_folder, checker_threads=False)
     app = create_app(config="cryptoadvance.specter.config.TestConfig")
     app.app_context().push()
     app.config["TESTING"] = True

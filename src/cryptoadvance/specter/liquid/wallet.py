@@ -8,12 +8,12 @@ from embit.liquid.descriptor import LDescriptor
 from embit.liquid.pset import PSET
 from embit.liquid.transaction import LTransaction
 
-from ..addresslist import Address
 from ..specter_error import SpecterError
 from ..wallet import *
 from .addresslist import LAddressList
 from .txlist import LTxList
 from .util.pset import SpecterPSET
+from .addresslist import Address
 
 
 class LWallet(Wallet):
@@ -88,6 +88,7 @@ class LWallet(Wallet):
                 self.change_address, assetlabel=None
             )
         except Exception as e:
+            handle_exception(e)
             # Could happen if address not in wallet (wallet was imported)
             # try adding keypool
             logger.info(
@@ -247,7 +248,7 @@ class LWallet(Wallet):
 
         if not readonly:
             self.save_pending_psbt(psbt)
-        return psbt.to_dict()
+        return psbt
 
     def canceltx(self, *args, **kwargs):
         raise SpecterError("RBF is not implemented on Liquid")

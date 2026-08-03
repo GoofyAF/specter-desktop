@@ -1,46 +1,50 @@
+from gc import callbacks
 import os
 import logging
 import secrets
 import shutil
 
 from ..rpc import get_default_datadir, RPC_PORTS
-from ..specter_error import SpecterError
-from ..persistence import write_node, delete_file
-from ..helpers import alias, load_jsons
-from ..node import Node
+from ..specter_error import SpecterError, SpecterInternalException
+from ..persistence import PersistentObject, write_node, delete_file
+from ..helpers import create_unique_id, calc_fullpath, load_jsons
+from ..node import Node, NonExistingNode
 from ..internal_node import InternalNode
+from ..services import callbacks
+from ..managers.service_manager import ExtensionManager
 from ..util.bitcoind_setup_tasks import setup_bitcoind_thread
 
 logger = logging.getLogger(__name__)
 
 
 class NodeManager:
-    # chain is required to manage wallets when bitcoind is not running
-    DEFAULT_ALIAS = "default"
-
     def __init__(
         self,
         proxy_url="socks5h://localhost:9050",
         only_tor=False,
-        active_node="default",
+        active_node=None,
         bitcoind_path="",
         internal_bitcoind_version="",
         data_folder="",
+        service_manager=None,
     ):
+        self.nodes = {}
+        # Dict is sth. like: {'nigiri_regtest': <Node name=Nigiri regtest fullpath=...>, 'default': <Node name=Bitcoin Core fullpath=...>}
         self.data_folder = data_folder
         self._active_node = active_node
         self.proxy_url = proxy_url
         self.only_tor = only_tor
         self.bitcoind_path = bitcoind_path
         self.internal_bitcoind_version = internal_bitcoind_version
-        self.update(data_folder)
+        self.service_manager: ExtensionManager = service_manager
+        self.load_from_disk(data_folder)
         internal_nodes = [
             node for node in self.nodes.values() if not node.external_node
         ]
         for node in internal_nodes:
             node.start()
 
-    def update(self, data_folder=None):
+    def load_from_disk(self, data_folder=None):
         if data_folder is not None:
             self.data_folder = data_folder
             if data_folder.startswith("~"):
@@ -48,70 +52,124 @@ class NodeManager:
             # creating folders if they don't exist
             if not os.path.isdir(data_folder):
                 os.mkdir(data_folder)
-        nodes = {}
-        nodes_files = load_jsons(self.data_folder, key="name")
+        nodes_files = load_jsons(self.data_folder, key="alias")
+        logger.debug(nodes_files)
         for node_alias in nodes_files:
-            fullpath = os.path.join(self.data_folder, "%s.json" % node_alias)
-            node_class = (
-                Node if nodes_files[node_alias]["external_node"] else InternalNode
-            )
-            nodes[nodes_files[node_alias]["name"]] = node_class.from_json(
-                nodes_files[node_alias],
-                self,
-                default_alias=node_alias,
-                default_fullpath=fullpath,
-            )
-        if not nodes:
+            try:
+                valid_node = True
+                node = PersistentObject.from_json(
+                    nodes_files[node_alias],
+                    self,
+                    default_alias=nodes_files[node_alias]["alias"],
+                    default_fullpath=calc_fullpath(self.data_folder, node_alias),
+                )
+                if (
+                    node.__class__.__module__.split(".")[1] == "specterext"
+                ):  # e.g. cryptoadvance.specterext.spectrum
+                    if self.service_manager:
+                        if not self.service_manager.is_class_from_loaded_extension(
+                            node.__class__
+                        ):
+                            logger.warning(
+                                f"Cannot Load {node} due to corresponding plugin not loaded"
+                            )
+                            continue
+                    else:
+                        logger.warning(
+                            f"Cannot validate Node {node} to be a valid node, skipping"
+                        )
+                        continue
+                self.nodes[node_alias] = node
+                logger.info(f"Loaded Node {self.nodes[node_alias]}")
+            except SpecterInternalException as e:
+                logger.error(f"Skipping node {node_alias} due to {e}")
+
+        if not self.nodes:
+            if os.environ.get("BTC_RPC_USER"):
+                logger.info(
+                    "Creating an external Bitcoin Core node from BTC_RPC_* environment variables."
+                )
+                node = self.add_external_node(
+                    node_type="BTC",
+                    name="Bitcoin Core",
+                    autodetect=False,
+                    datadir=get_default_datadir(node_type="BTC"),
+                    user=os.environ.get("BTC_RPC_USER"),
+                    password=os.environ.get("BTC_RPC_PASSWORD", ""),
+                    port=os.environ.get("BTC_RPC_PORT", "8332"),
+                    host=os.environ.get("BTC_RPC_HOST", "localhost"),
+                    protocol=os.environ.get("BTC_RPC_PROTOCOL", "http"),
+                )
+                self._active_node = node.alias
             if os.environ.get("ELM_RPC_USER"):
-                self.add_node(
+                logger.debug(
+                    "Creating an external Elements node with the initial configuration."
+                )
+                self.add_external_node(
                     node_type="ELM",
                     name="Blockstream Liquid",
-                    autodetect=True,
+                    autodetect=False,
                     datadir=get_default_datadir(node_type="ELM"),
                     user="",
                     password="",
                     port=7041,
                     host="localhost",
                     protocol="http",
-                    external_node=True,
-                    default_alias=self.DEFAULT_ALIAS,
                 )
-            self.add_node(
-                node_type="BTC",
-                name="Bitcoin Core",
-                autodetect=True,
-                datadir=get_default_datadir(),
-                user="",
-                password="",
-                port=8332,
-                host="localhost",
-                protocol="http",
-                external_node=True,
-                default_alias=self.DEFAULT_ALIAS,
-            )
-        else:
-            self.nodes = nodes
 
     @property
-    def active_node(self):
-        return self.get_by_alias(self._active_node)
+    def active_node(self) -> Node:
+        """returns the current active node or a NonExistingNode
+        if no node is active, currently.
+        """
+        active_node = self.get_by_alias(self._active_node)
+        return active_node if active_node else NonExistingNode()
 
     @property
-    def nodes_names(self):
-        return sorted(self.nodes.keys())
+    def nodes_names(self) -> list:
+        """Returns a list of the names (not the aliases) of the nodes"""
+        return [node.name for node in self.nodes.values()]
 
-    def switch_node(self, node_alias):
-        # this will throw an error if the node doesn't exist
-        self._active_node = self.get_by_alias(node_alias).alias
+    def nodes_by_chain(self, chain: str) -> list:
+        """Returns a list of nodes for a given blockchain"""
+        return [node for node in self.nodes.values() if node.chain == chain]
 
-    def default_node(self):
-        return self.get_by_alias(self.DEFAULT_ALIAS)
+    def switch_node(self, node_alias: str):
+        """This will throw an SpecterError if the node doesn't exist.
+        It won't persist anything! Use specter.update_active_node to persist!
+        """
+        new_node = self.get_by_alias(node_alias)
+        if not new_node:
+            raise SpecterError(f"Node alias {node_alias} does not exist!")
+        logger.debug(f"Switching from {self._active_node} to {node_alias}.")
+        self._active_node = node_alias
 
-    def get_by_alias(self, alias):
-        for node_name in self.nodes:
-            if self.nodes[node_name] and self.nodes[node_name].alias == alias:
-                return self.nodes[node_name]
-        raise SpecterError("Node %s does not exist!" % alias)
+    def get_by_alias(self, alias: str) -> Node:
+        """Returns a Node instance for the given alias.
+        None if a node with that alias doesn't exist
+        """
+        for node in self.nodes.values():
+            if node.alias == alias:
+                return node
+        return None
+
+    def get_by_name(self, name: str) -> Node:
+        """Returns a Node instance for the given alias.
+        raises an SpecterError if it doesn't exist
+        """
+        for node in self.nodes.values():
+            if node.name == name:
+                return node
+        raise SpecterError("Node name %s does not exist!" % name)
+
+    def get_name_from_alias(self, alias: str) -> str:
+        """Returns the name for a specific node alias
+        raises an SpecterError if it doesn't exist
+        """
+        for node in self.nodes.values():
+            if node.alias == alias:
+                return node.name
+        raise SpecterError("Node alias %s does not exist!" % alias)
 
     def update_bitcoind_version(self, specter, version):
         stopped_nodes = []
@@ -131,32 +189,31 @@ class NodeManager:
         for node_alias in stopped_nodes:
             self.get_by_alias(node_alias).start(timeout=60)
 
-    def add_node(
+    def add_external_node(
         self,
-        node_type,
-        name,
-        autodetect,
+        node_type: str,
+        name: str,
+        autodetect: bool,
         datadir,
-        user,
-        password,
-        port,
-        host,
-        protocol,
-        external_node,
-        default_alias=None,
+        user: str,
+        password: str,
+        port: str,
+        host: str,
+        protocol: str,
     ):
-        """Adding a node. Params:
-        :param node_type: only valid for autodetect. Either BTC or ELM
-
+        """Adding a node and saves it to disk as well. Params:
+        * node_type: only valid for autodetect. Either BTC or ELM
+        * name: A nice name for this node. The alias will get calculated out of that
+        * autodetect (boolean): whether this node should get autodetected
+        * datadir: questionable! Why is that here needed?!
+        This should only be used for an external node. Use add_internal_node for internal node
+        and if you have defined your own node type, use save_node directly to save the node (and create it yourself)
         """
-        if not default_alias:
-            node_alias = alias(name)
-        else:
-            node_alias = default_alias
+        node_alias = create_unique_id(name)
         fullpath = os.path.join(self.data_folder, "%s.json" % node_alias)
         i = 2
         while os.path.isfile(fullpath):
-            node_alias = alias("%s %d" % (name, i))
+            node_alias = create_unique_id("%s %d" % (name, i))
             fullpath = os.path.join(self.data_folder, "%s.json" % node_alias)
             i += 1
 
@@ -170,33 +227,39 @@ class NodeManager:
             port,
             host,
             protocol,
-            external_node,
             fullpath,
             node_type,
             self,
         )
-        logger.info(f"persisting {node} in add_node")
-        write_node(node, fullpath)
-        self.update()  # reload files
-        logger.info("Added new node {}".format(node.alias))
+        logger.debug(f"Persisting {node_alias} from an add_external_node call.")
+        self.nodes[node_alias] = node
+        self.save_node(node)
         return node
+
+    def save_node(self, node):
+        """writes the node to disk. Will also apply a fullpath based on the datadir of the
+        NodeManager if the node doesn't have one."""
+        if not hasattr(node, "fullpath"):
+            node.fullpath = calc_fullpath(self.data_folder, node.alias)
+        write_node(node, node.fullpath)
+        logger.info(f"Saved new node {node.alias} at {node.fullpath}")
 
     def add_internal_node(
         self,
-        name,
+        name: str,
         network="main",
-        port=None,
-        default_alias=None,
+        port: str = None,
         datadir=None,
     ):
-        if not default_alias:
-            node_alias = alias(name)
-        else:
-            node_alias = default_alias
+        """Adding an internal node. Params:
+        This should only be used for internal nodes. Use add__External_node for external nodes
+        and if you have defined your own node-type, use save_node directly. to save the node (and create it yourself)
+        """
+        node_alias = create_unique_id(name)
         fullpath = os.path.join(self.data_folder, "%s.json" % node_alias)
         i = 2
         while os.path.isfile(fullpath):
-            node_alias = alias("%s %d" % (name, i))
+            node_alias = create_unique_id("%s %d" % (name, i))
             fullpath = os.path.join(self.data_folder, "%s.json" % node_alias)
             i += 1
         if not datadir:
@@ -218,19 +281,24 @@ class NodeManager:
             network,
             self.internal_bitcoind_version,
         )
-        logger.info(f"persisting {node} in add_internal_node")
-        write_node(node, fullpath)
-        self.update()  # reload files
-        logger.info("Added new internal node {}".format(node.alias))
+        self.nodes[node_alias] = node
+        self.save_node(node)
         return node
 
     def delete_node(self, node, specter):
+        """Deletes the node. Also from the disk."""
         logger.info("Deleting {}".format(node.alias))
-        # Delete files
-        delete_file(node.fullpath)
-        delete_file(node.fullpath + ".bkp")
-        if self._active_node == node.alias:
-            specter.update_active_node(next(iter(self.nodes.values())).alias)
-        del self.nodes[node.name]
-        self.update()
-        logger.info("Node {} was deleted successfully".format(node.alias))
+        try:
+            # Delete from wallet manager
+            del self.nodes[node.alias]
+            # Delete files
+            delete_file(node.fullpath)
+            delete_file(node.fullpath + ".bkp")
+            # Update the active node
+            if self._active_node == node.alias and len(self.nodes) > 0:
+                specter.update_active_node(
+                    next(iter(self.nodes.values())).alias
+                )  # This switches to the first node in the node list, which is usually the default node
+            logger.info("Node {} was deleted successfully".format(node.alias))
+        except KeyError:
+            raise SpecterError(f"{node.name} not found, node could not be deleted.")

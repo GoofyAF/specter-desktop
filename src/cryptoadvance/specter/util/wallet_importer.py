@@ -1,17 +1,19 @@
 import json
 import logging
+
 import requests
-from cryptoadvance.specter.managers.wallet_manager import WalletManager
-
-from cryptoadvance.specter.specter_error import SpecterError
-
 from embit.descriptor import Descriptor
 from embit.descriptor import Key as DescriptorKey
 from embit.descriptor.arguments import AllowedDerivation
 from embit.liquid.descriptor import LDescriptor
-from cryptoadvance.specter.key import Key
-from flask import flash
 from flask_babel import lazy_gettext as _
+
+from cryptoadvance.specter.device import Device
+
+from ..key import Key
+from ..managers.wallet_manager import WalletManager
+from ..server_endpoints import flash
+from ..specter_error import SpecterError
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,8 @@ class WalletImporter:
         try:
             self.descriptor = DescriptorCls.from_string(recv_descriptor)
             self.check_descriptor()
-        except Exception as e:
-            raise SpecterError(f"Invalid wallet descriptor: {e}")
+        except ValueError as e:
+            raise SpecterError(f"{e}: {recv_descriptor}")
         if self.wallet_name in specter.wallet_manager.wallets_names:
             raise SpecterError(f"Wallet with the same name already exists")
         (
@@ -58,7 +60,35 @@ class WalletImporter:
             self.unknown_cosigners,
             self.unknown_cosigners_types,
         ) = self.parse_signers(device_manager.devices, self.cosigners_types)
+        try:
+            self.check_chain(specter.node)
+        except Exception as e:
+            logger.exception(e)
+            raise SpecterError(f"Invalid chain: {e}")
         self.wallet_type = "multisig" if self.descriptor.is_basic_multisig else "simple"
+
+    def check_chain(self, node):
+
+        cosigner: Device
+        for cosigner in self.cosigners:
+
+            key_chain_list = [key.is_testnet for key in cosigner.keys]
+            logger.debug(key_chain_list)
+            if node.is_testnet not in key_chain_list:
+                raise SpecterError(
+                    f"The device {cosigner.alias} does not have any key for the chain {node.chain}!"
+                )
+        for key, label in self.unknown_cosigners:
+            if key.is_testnet != node.is_testnet:
+                raise SpecterError(
+                    f"The device {label} has at least one key for the chain {key.metadata['chain'] } whereas your node is on the chain: {node.chain}!"
+                )
+        key: Key
+        for key in self.keys:
+            if key.is_testnet != node.is_testnet:
+                raise SpecterError(
+                    f"The key {key} belongs to the chain {key.metadata['chain'] } but your node is on the chain {node.chain}!"
+                )
 
     def check_descriptor(self):
         # Sparrow fix: if all keys have None as allowed derivation - set allowed derivation to [0, None]
@@ -86,6 +116,15 @@ class WalletImporter:
                 )
 
     def parse_signers(self, devices, cosigners_types):
+        """returns:
+            * keys:
+                * keys which are already existing in the device_manager
+                * keys:[<cryptoadvance.specter.key.Key object at 0x7fda8451e0e0>]
+            # cosigners:
+                * [<cryptoadvance.specter.devices.generic.GenericDevice object at 0x7fda8451fcd0>]
+        # unknown_cosigners:[(<cryptoadvance.specter.key.Key object at 0x7fda8451e830>, 'Signer - K'), (<cryptoadvance.specter.key.Key object at 0x7fda94235570>, 'Signer - Tired no WP')]
+
+        """
         keys = []
         cosigners = []
         unknown_cosigners = []
@@ -119,7 +158,11 @@ class WalletImporter:
                     unknown_cosigners_types.append("other")
                 else:
                     unknown_cosigners_types.append(cosigners_types[i]["type"])
-
+        logger.debug("parse_signers returning:")
+        logger.debug(f"keys:{keys}")
+        logger.debug(f"cosigners:{cosigners}")
+        logger.debug(f"unknown_cosigners:{unknown_cosigners}")
+        logger.debug(f"unknown_cosigners_types:{unknown_cosigners_types}")
         return (keys, cosigners, unknown_cosigners, unknown_cosigners_types)
 
     def create_nonexisting_signers(self, device_manager, request_form):
@@ -195,10 +238,12 @@ class WalletImporter:
                 key_type=self.address_type,
                 keys=self.keys,
                 devices=self.cosigners,
+                imported_descriptor=self.descriptor,
                 **kwargs,
             )
         except Exception as e:
-            raise SpecterError(f"Failed to create wallet: {e}")
+            logger.exception(e)
+            raise SpecterError(f"Failed to create wallet: {e} (check logs for details)")
         logger.info(f"Created Wallet {self.wallet}")
         self.wallet.keypoolrefill(0, self.wallet.IMPORT_KEYPOOL, change=False)
         self.wallet.keypoolrefill(0, self.wallet.IMPORT_KEYPOOL, change=True)
@@ -229,7 +274,7 @@ class WalletImporter:
             self.wallet.rpc.rescanblockchain(startblock, no_wait=True)
             logger.info("Rescanning Blockchain ...")
         except Exception as e:
-            logger.error("Exception while rescanning blockchain: %r" % e)
+            logger.exception("Exception while rescanning blockchain")
             if potential_errors:
                 potential_errors = SpecterError(
                     str(potential_errors)
@@ -289,7 +334,7 @@ class WalletImporter:
                     wallet_data["x1/"]["xpub"]
                 )
             else:
-                raise Exception('"xpub" not found in "x1/" in Electrum backup json')
+                raise SpecterError('"xpub" not found in "x1/" in Electrum backup json')
 
             required_sigs = int(wallet_data.get("wallet_type").split("of")[0])
             recv_descriptor = "{}(sortedmulti({},{}))".format(
@@ -438,7 +483,7 @@ class WalletImporter:
                     wallet_data["keystore"]["xpub"], is_multisig=False
                 )
             else:
-                raise Exception(
+                raise SpecterError(
                     '"xpub" not found in "keystore" in Electrum backup json'
                 )
             recv_descriptor = "{}({})".format(
@@ -472,6 +517,13 @@ class WalletImporter:
 
             wallet_name = wallet_data.get("label", "Imported Wallet")
             recv_descriptor = wallet_data.get("descriptor", None)
+
+        if wallet_name is None:
+            raise SpecterError(
+                f"Couldn't find 'name' in wallet json (alias: {wallet_data.get('alias','also not existing')})."
+            )
+        if recv_descriptor is None:
+            raise SpecterError("Couldn't find 'recv_descriptor' in wallet json.")
 
         return (wallet_name, recv_descriptor, cosigners_types)
 

@@ -68,7 +68,7 @@ WantedBy=multi-user.target
 
 You can check the status of specter.service by running `systemctl status specter.service` or for debugging, you can get more information by running `sudo journalctl -fu specter.service`
 
-The commented section of the service file above refers to an optional reverse proxy setup which is covered in the [reverse_proxy.md](reverse_proxy.md) document.
+The commented section of the service file above refers to an optional reverse proxy setup which is covered in the [reverse_proxy.md](reverse-proxy.md) document.
 
 ## bitcoind as a Service
 
@@ -77,9 +77,9 @@ To make bitcoind service follow the same steps, just name the service `bitcoind.
 
 ## Specter with virtual environment
 
-Let's say you don't want to have Specter in you global python modules, but use a virtual environment instead.
+If you don't want to have Specter in your global python modules, you can use a virtual environment instead.
 
-First create the virtual environment and install Specter there, let's say the path is `/home/myusername/.venv_specter`.
+First create the virtual environment and install Specter there. Let's say the path is `/home/myusername/.venv_specter`.
 
 Then you need to change the `specter.service` to the following:
 

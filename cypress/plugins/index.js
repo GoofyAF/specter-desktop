@@ -21,8 +21,17 @@ module.exports = (on, config) => {
   // `config` is the resolved Cypress config
   const btc_conn_file = fs.readFileSync('btcd-conn.json');
   const btc_conn = JSON.parse(btc_conn_file);
-  const elm_conn_file = fs.readFileSync('elmd-conn.json');
-  const elm_conn = JSON.parse(elm_conn_file);
+  const elm_conn_file_path = 'elmd-conn.json';
+  // Elementsd is not always started
+  let elm_conn
+  if (fs.existsSync(elm_conn_file_path)) {
+    const elm_conn_file = fs.readFileSync(elm_conn_file_path);
+    elm_conn = JSON.parse(elm_conn_file);
+  }
+  else {
+    elm_conn = ''
+  }
+
   on('task', {
     'clear:specter-home': () => {
       console.log('Removing and recreating Specter-data-folder %s', btc_conn["specter_data_folder"])
@@ -49,6 +58,17 @@ module.exports = (on, config) => {
   })
 
   on('task', {
+    'delete:bitcoin-hotwallet': (name) => {
+      console.log('connection details: %s', btc_conn)
+      const bitcoin_data_dir=btc_conn["bitcoin_data_dir"];
+      var rimraf = require("rimraf");
+      console.log('Removing all wallets in %s', bitcoin_data_dir+"/regtest/wallets/specter123456_hotstorage")
+      rimraf.sync(bitcoin_data_dir+"/regtest/wallets/specter123456_hotstorage");
+      return null
+    }
+  })
+
+  on('task', {
     'btc:mine': () => {
       // sending the bitcoind-process a signal SIGUSR1 (10) will cause mining towards all specter-wallets
       // See the signal-handler in bitcoind
@@ -68,6 +88,16 @@ module.exports = (on, config) => {
     }
   })
 
-
+  on("task", {
+    isElementsRunning: () => {
+      const elm_conn_file_path = "elmd-conn.json";
+      if (fs.existsSync(elm_conn_file_path)) {
+        return true;
+      } 
+      else {
+        return false;
+      }
+    },
+  });
 
 }

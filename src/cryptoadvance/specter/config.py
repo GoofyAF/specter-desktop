@@ -49,12 +49,15 @@ class BaseConfig(object):
     SPECTER_URL_PREFIX = "/spc"
     # This enables the isolated_client-extensions, SECURITY-CRITICAL
     SESSION_COOKIE_PATH = SPECTER_URL_PREFIX
-    SESSION_COOKIE_NAME = "specter"
+    # should be "strong" until you're running specter behind a loadbalancer which accesses specter with more than one IP
+    SESSION_PROTECTION = os.getenv("SESSION_PROTECTION", "strong")
+    SESSION_PROTECTION = None if SESSION_PROTECTION == "none" else SESSION_PROTECTION
     # The prefix for extensions which get access to the session cookie
     EXT_URL_PREFIX = "/spc/ext"
     # The prefix for extensions which don't get access to the session cookie (if SPECTER_URL_PREFIX isn't compromised)
     ISOLATED_CLIENT_EXT_URL_PREFIX = "/ext"
 
+    HOST = os.getenv("HOST", "127.0.0.1")
     PORT = os.getenv("PORT", 25441)
     CONNECT_TOR = _get_bool_env_var(os.getenv("CONNECT_TOR", "False"))
     SPECTER_DATA_FOLDER = os.path.expanduser(
@@ -68,9 +71,28 @@ class BaseConfig(object):
         "SPECTER_LOGFORMAT", "[%(asctime)s] %(levelname)s in %(module)s: %(message)s"
     )
 
+    # The Werkzeug Logs which are documenting each request are quite annoying with Cypress
+    # but by default, we have a good replacement
+    ENABLE_WERZEUG_REQUEST_LOGGING = _get_bool_env_var(
+        "ENABLE_WERZEUG_REQUEST_LOGGING", "False"
+    )
+    ENABLE_OWN_REQUEST_LOGGING = _get_bool_env_var("ENABLE_OWN_REQUEST_LOGGING", "True")
+
     # CERT and KEY is for running self-signed-ssl-certs. Check cli_server for details
     CERT = os.getenv("CERT", None)
     KEY = os.getenv("KEY", None)
+
+    # It might be necessary / useful for testing to skip the HWI initialisation (i.e. calling enumerate on startup)
+    SKIP_HWI_INITIALISATION_AT_STARTUP = _get_bool_env_var(
+        "SKIP_HWI_INITIALISATION_AT_STARTUP", False
+    )
+
+    # This will be used to search for a bitcoin.conf in order to enable the
+    # auth method "RPC password as pin"
+    RASPIBLITZ_SPECTER_RPC_LOGIN_BITCOIN_CONF_LOCATION = os.getenv(
+        "RASPIBLITZ_SPECTER_RPC_LOGIN_BITCOIN_CONF_LOCATION", "/mnt/hdd/bitcoin"
+    )
+
     # This will get passed to initialize the specter-object
     DEFAULT_SPECTER_CONFIG = {}
 
@@ -167,8 +189,16 @@ class BaseConfig(object):
 
     # List of extensions (services) to potentially load
     EXTENSION_LIST = [
-        "cryptoadvance.specter.services.swan.service",
-        "cryptoadvance.specter.services.bitcoinreserve.service",
+        "cryptoadvance.specterext.swan.service",
+        "cryptoadvance.specterext.liquidissuer.service",
+        "cryptoadvance.specterext.devhelp.service",
+        "cryptoadvance.specterext.notifications.service",
+        "cryptoadvance.specterext.exfund.service",
+        "cryptoadvance.specterext.faucet.service",
+        "cryptoadvance.specterext.electrum.service",
+        "cryptoadvance.specterext.spectrum.service",
+        "cryptoadvance.specterext.stacktrack.service",
+        "oren-z0.specterext.timelockrecovery.service",
     ]
 
     # This is just a placeholder in order to be aware that you cannot set this
@@ -178,6 +208,12 @@ class BaseConfig(object):
     REQUEST_TIME_WARNING_THRESHOLD = int(
         os.getenv("REQUEST_TIME_WARNING_THRESHOLD", "20")
     )
+
+    # As described in https://github.com/cryptoadvance/specter-desktop/pull/1579#issuecomment-1049895972
+    # This should get removed after v1.9.0 is out.
+    SPECTER_URL_PREFIX = ""
+    EXT_URL_PREFIX = "/svc"
+    SESSION_COOKIE_PATH = SPECTER_URL_PREFIX
 
 
 class DevelopmentConfig(BaseConfig):
@@ -217,6 +253,8 @@ class TestConfig(BaseConfig):
     BITCOIN_RPC_TIMEOUT = 60
     LIQUID_RPC_TIMEOUT = 60
 
+    SERVICES_DEVSTATUS_THRESHOLD = "beta"
+
 
 class CypressTestConfig(TestConfig):
     SPECTER_URL_PREFIX = ""
@@ -226,6 +264,9 @@ class CypressTestConfig(TestConfig):
         os.getenv("SPECTER_DATA_FOLDER", "~/.specter_cypress")
     )
     PORT = os.getenv("PORT", 25444)
+
+    # The Werkzeug Logs which are documenting each request are quite annoying with Cypress
+    ENABLE_WERZEUG_REQUEST_LOGGING = False
 
     # need to be static in order to (un-)tar bitcoind-dirs reliable
     DEFAULT_SPECTER_CONFIG = {"uid": "123456"}
@@ -239,18 +280,20 @@ class CypressTestConfig(TestConfig):
     )
     BITCOIN_RPC_TIMEOUT = 30
     LIQUID_RPC_TIMEOUT = 40
+    SERVICES_DEVSTATUS_THRESHOLD = "beta"
 
 
 class ProductionConfig(BaseConfig):
-    SECRET_KEY = secrets.token_urlsafe(16)
+    # Injectable, as having a random SECRET-KEY won't work for gunicorn using more than one worker (might have more issues with multiple workers, though)
+    SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(16))
     # There are some really slow machines out there. Creating a 2/4 multisig on an older MacBookAir
     # Take already >30secs
-    BITCOIN_RPC_TIMEOUT = 60
-    LIQUID_RPC_TIMEOUT = 120
+    BITCOIN_RPC_TIMEOUT = float(os.getenv("BITCOIN_RPC_TIMEOUT", "60"))
+    LIQUID_RPC_TIMEOUT = float(os.getenv("LIQUID_RPC_TIMEOUT", "120"))
 
     # Repeating it here as it's SECURITY CRITICAL. Check comments in BaseConfig
     SERVICES_LOAD_FROM_CWD = False
-    SPECTER_URL_PREFIX = "/spc"
-    EXT_URL_PREFIX = "/spc/ext"
-    EXTERNAT_EXT_URL_PREFIX = "/ext"
-    SESSION_COOKIE_PATH = SPECTER_URL_PREFIX
+    # SPECTER_URL_PREFIX = "/spc"
+    # EXT_URL_PREFIX = "/spc/ext"
+    # EXTERNAT_EXT_URL_PREFIX = "/ext"
+    # SESSION_COOKIE_PATH = SPECTER_URL_PREFIX

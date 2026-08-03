@@ -1,5 +1,11 @@
 import os
-from cryptoadvance.specter.persistence import write_devices, write_device, write_wallet
+from unittest.mock import MagicMock, Mock
+from cryptoadvance.specter.persistence import (
+    write_devices,
+    write_device,
+    write_wallet,
+    PersistentObject,
+)
 from cryptoadvance.specter.key import Key
 import json
 
@@ -57,27 +63,19 @@ def test_write_wallet(app, monkeypatch, caplog):
     assert "callback failed" in caplog.text
 
 
-def test_write_device(app):
-    a_key = Key(
-        "Vpub5n9kKePTPPGtw3RddeJWJe29epEyBBcoHbbPi5HhpoG2kTVsSCUzsad33RJUt3LktEUUPPofcZczuudnwR7ZgkAkT6N2K2Z7wdyjYrVAkXM",
-        "08686ac6",
-        "m/48h/1h/0h/2h",
-        "wsh",
-        "",
-        "tpubDFHpKypXq4kwUrqLotPs6fCic5bFqTRGMBaTi9s5YwwGymE8FLGwB2kDXALxqvNwFxB1dLWYBmmeFVjmUSdt2AsaQuPmkyPLBKRZW8BGCiL",
-    )
-    # the DeviceManager doesn't care so much about the content of a key
-    # so this is a minimal valid "key":
-    another_key = Key.from_json(
-        {
-            "original": "tpubDDZ5jjGT5RvrAyjoLZfdCfv1PAPmicnhNctwZGKiCMF1Zy5hCGMqppxwYZzWgvPqk7LucMMHo7rkB6Dyj5ZLd2W62FAEP3U6pV4jD5gb9ma"
-        }
-    )
+def test_write_device(app, a_key, a_tpub_only_key):
     app.specter.device_manager.add_device(
-        "some_name2", "the_type", [a_key, another_key]
+        "some_name2", "the_type", [a_key, a_tpub_only_key]
     )
     write_device(
         app.specter.device_manager.get_by_alias("some_name2"),
         "/tmp/delete_me_test_file.json",
     )
     os.remove("/tmp/delete_me_test_file.json")
+
+
+def test_PersistentObject():
+    some_node = PersistentObject.from_json(
+        {"python_class": "cryptoadvance.specter.node.Node"}, MagicMock()
+    )
+    assert some_node.__class__.__name__ == "Node"

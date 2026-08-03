@@ -1,18 +1,23 @@
-import random, traceback
+import random
+import traceback
+import logging
+from pathlib import Path
 from time import time
-from binascii import unhexlify
-from flask import make_response
+from urllib.parse import urlparse, ParseResult
+
+from flask import g, redirect, render_template, request, url_for, request
+from flask.wrappers import Response, Request
+from flask_babel import lazy_gettext as _
 from flask_wtf.csrf import CSRFError
 from werkzeug.exceptions import MethodNotAllowed, NotFound
-from flask import render_template, request, redirect, url_for, flash, g
-from flask_babel import lazy_gettext as _
-from flask_login import login_required, current_user
-from ..helpers import (
-    generate_mnemonic,
-    notify_upgrade,
+
+from ..server_endpoints import flash
+from ..services.callbacks import flask_before_request
+from ..specter_error import (
+    ExtProcTimeoutException,
+    SpecterError,
+    BrokenCoreConnectionException,
 )
-from ..specter_error import SpecterError, ExtProcTimeoutException
-from pathlib import Path
 
 env_path = Path(".") / ".flaskenv"
 from dotenv import load_dotenv
@@ -20,12 +25,17 @@ from dotenv import load_dotenv
 load_dotenv(env_path)
 
 from flask import current_app as app
+
 from .filters import filters_bp
 
 app.register_blueprint(filters_bp)
 
+# Services live in their own separate path
+from cryptoadvance.specter.services.controller import services_endpoint
+
+from ..rpc import RpcError
+
 # Setup specter endpoints
-from .welcome import welcome_endpoint
 from .auth import auth_endpoint
 from .devices import devices_endpoint
 from .nodes import nodes_endpoint
@@ -33,11 +43,8 @@ from .price import price_endpoint
 from .settings import settings_endpoint
 from .setup import setup_endpoint
 from .wallets import wallets_endpoint
-from .wallets_api import wallets_endpoint_api
-from ..rpc import RpcError
-
-# Services live in their own separate path
-from cryptoadvance.specter.services.controller import services_endpoint
+from .wallets.wallets_api import wallets_endpoint_api
+from .welcome import welcome_endpoint
 
 spc_prefix = app.config["SPECTER_URL_PREFIX"]
 app.register_blueprint(welcome_endpoint, url_prefix=f"{spc_prefix}/welcome")
@@ -51,18 +58,23 @@ app.register_blueprint(setup_endpoint, url_prefix=f"{spc_prefix}/setup")
 app.register_blueprint(wallets_endpoint, url_prefix=f"{spc_prefix}/wallets")
 app.register_blueprint(wallets_endpoint_api, url_prefix=f"{spc_prefix}/wallets")
 
-rand = random.randint(0, 1e32)  # to force style refresh
+rand = random.randint(0, int(1e32))  # to force style refresh
+logger = logging.getLogger(__name__)
 
 ########## exception handlers ##############
 @app.errorhandler(RpcError)
 def server_rpc_error(rpce):
     """Specific SpecterErrors get passed on to the User as flash"""
+    if request.headers.get("Accept") == "application/json":
+        return {"error": str(rpce)}
     if rpce.error_code == -18:  # RPC_WALLET_NOT_FOUND
+
         flash(
             _("Wallet not found. Specter reloaded all wallets, please try again."),
             "error",
         )
     else:
+
         flash(_("Bitcoin Core RpcError: {}").format(str(rpce)), "error")
     try:
         app.specter.wallet_manager.update()
@@ -73,10 +85,12 @@ def server_rpc_error(rpce):
 
 @app.errorhandler(SpecterError)
 def server_specter_error(se):
-    """Specific SpecterErrors get passed on to the User as flash"""
+    """Specific SpecterErrors get passed on to the User as flash (or in error-field for json)"""
+    if request.headers.get("Accept") == "application/json":
+        return {"error": str(se)}
     flash(str(se), "error")
     try:
-        app.specter.wallet_manager.update()
+        app.specter.wallet_manager.update(comment="via server_specter_error")
     except SpecterError as se:
         flash(str(se), "error")
     if request.method == "POST":
@@ -90,40 +104,64 @@ def server_specter_error(se):
 def server_notFound_error(e):
     """Unspecific Exceptions get a 404 Error-Page"""
     # if rpc is not available
-    app.logger.error("Could not find Resource (404): %s" % request.url)
-    return render_template("500.jinja", error=e), 404
+    error_msg = "Could not find Resource (404): %s" % request.url
+    app.logger.error(error_msg)
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    return (
+        render_template("500.jinja", error=e, version=app.specter.version.current),
+        404,
+    )
 
 
 @app.errorhandler(Exception)
 def server_error(e):
     """Unspecific Exceptions get a 500 Error-Page"""
-    # if rpc is not available
-    if app.specter.rpc is None or not app.specter.rpc.test_connection():
-        # make sure specter knows that rpc is not there
-        app.specter.check()
-    app.logger.error("Uncaught exception: %s" % e)
+    error_msg = "Uncaught exception: %s" % e
+    app.logger.error(error_msg)
     trace = traceback.format_exc()
     app.logger.error(trace)
-    return render_template("500.jinja", error=e, traceback=trace), 500
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    return (
+        render_template(
+            "500.jinja", error=e, traceback=trace, version=app.specter.version.current
+        ),
+        500,
+    )
+
+
+@app.errorhandler(BrokenCoreConnectionException)
+def server_broken_core_connection(e):
+    error_msg = "You got disconnected from your node (no RPC connection)"
+    logger.exception(e)
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    flash(error_msg, "error")
+    try:
+        app.specter.check()
+        return redirect(url_for("welcome_endpoint.about"))
+    except Exception as e:
+        logger.exception(e)
+        return server_error(e)
 
 
 @app.errorhandler(ExtProcTimeoutException)
 def server_error_timeout(e):
     """Unspecific Exceptions get a 500 Error-Page"""
-    # if rpc is not available
+    error_msg = _(
+        "Bitcoin Core is not coming up in time. Maybe it's just slow but please check the logs below"
+    )
     if app.specter.rpc is None or not app.specter.rpc.test_connection():
         # make sure specter knows that rpc is not there
         app.specter.check()
     app.logger.error("ExternalProcessTimeoutException: %s" % e)
-    flash(
-        _(
-            "Bitcoin Core is not coming up in time. Maybe it's just slow but please check the logs below"
-        ),
-        "warn",
-    )
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    flash(error_msg, "warn")
     return redirect(
         url_for(
-            "node_settings.bitcoin_core_internal_logs",
+            "nodes_endpoint.internal_node_logs",
             node_alias=app.specter.node.alias,
         )
     )
@@ -134,20 +172,31 @@ def server_error_csrf(e):
     """CSRF token missing. Most likely session expired.
     If persisting after refresh this could mean the front-end
     is not sending the CSRF token properly in some form"""
+    error_msg = _("Session expired (CSRF). Please refresh and try again.")
     app.logger.error("CSRF Exception: %s" % e)
     trace = traceback.format_exc()
     app.logger.error(trace)
-    flash(_("Session expired. Please refresh and try again."), "error")
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    flash(error_msg, "error")
     return redirect(request.url)
 
 
 @app.errorhandler(MethodNotAllowed)
 def server_error_405(e):
     """405 method not allowed. Token might have expired."""
-    app.logger.error("405 MethodNotAllowed Exception: %s" % e)
+    error_msg = _("405 method not allowed. Token might have expired.")
+    app.logger.error(f"{error_msg} : {e}")
     trace = traceback.format_exc()
     app.logger.error(trace)
-    flash(_("Session expired. Please refresh and try again."), "error")
+    if request.headers.get("Accept") == "application/json":
+        return {"error": error_msg}
+    flash(
+        _(
+            "Method not allowed. Probably the session expired. Please refresh and try again."
+        ),
+        "error",
+    )
     return redirect(request.url)
 
 
@@ -157,24 +206,44 @@ def selfcheck():
     """check status before every request"""
     if app.specter.rpc is not None:
         type(app.specter.rpc).counter = 0
-        if not app.specter.chain:
-            app.specter.check()
     if app.config.get("LOGIN_DISABLED"):
         app.login("admin")
 
 
 @app.before_request
 def slow_request_detection_start():
-    """ """
     g.start = time()
 
 
+@app.before_request
+def execute_service_manager_hook():
+    """inform extensions about the request"""
+    app.specter.service_manager.execute_ext_callbacks(flask_before_request, request)
+
+
 @app.after_request
-def slow_request_detection_stop(response):
+def slow_request_detection_stop(response: Response):
     try:
         diff = time() - g.start
+        if (
+            not request.url.__contains__("static")
+            and app.config["ENABLE_OWN_REQUEST_LOGGING"]
+        ):
+            # This is supposed to replace the annoying ENABLE_WERZEUG_REQUEST_LOGGING
+            # but only for non static Requests which are indeed interesting
+            # Original looks like this:
+            # [2023-02-10 14:15:49,716] INFO in _internal: 127.0.0.1 - - [10/Feb/2023 14:15:49] "GET /ext/devhelp/static/devhelp/img/orange-wrench.png HTTP/1.1" 304 -
+            url: ParseResult = urlparse(request.url)
+            logger.info(  # commas for being able to split up more easily afterwards
+                "{}, {: <40}, {}, took, {: >4}, ms".format(
+                    request.method,
+                    url.path + url.params + url.query + url.fragment,
+                    response.status_code,
+                    int(diff * 1000),
+                )
+            )
     except Exception as e:
-        app.logger.error(e)
+        app.logger.exception(e)
         return response
     if (
         (response.response)
@@ -196,9 +265,14 @@ def slow_request_detection_stop(response):
 
 ########## template injections #############
 @app.context_processor
-def inject_debug():
+def inject_common_stuff():
     """Can be used in all jinja2 templates"""
-    return dict(debug=app.config["DEBUG"])
+    return dict(
+        debug=app.config["DEBUG"],
+        specter_url_prefix=app.config["APP_URL_PREFIX"]
+        + app.config["SPECTER_URL_PREFIX"],
+        ext_url_prefix=app.config["APP_URL_PREFIX"] + app.config["EXT_URL_PREFIX"],
+    )
 
 
 ################ Specter global routes ####################
@@ -216,3 +290,18 @@ if app.config["SPECTER_URL_PREFIX"] != "":
     @app.route(f"{app.config['SPECTER_URL_PREFIX']}/")
     def index_prefix():
         return redirect(url_for("welcome_endpoint.index"))
+
+
+@app.route("/healthz/liveness")
+def liveness():
+    return {"message": "i am alive"}
+
+
+@app.route("/healthz/readyness")
+def readyness():
+    try:
+        # Probably improvable:
+        app.specter.check()
+    except Exception as e:
+        return {"message": "i am not ready"}, 500
+    return {"message": "i am ready"}

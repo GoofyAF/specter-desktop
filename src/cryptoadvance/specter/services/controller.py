@@ -1,10 +1,14 @@
 import logging
+from functools import wraps
 
-from flask import Blueprint, render_template, redirect, url_for, flash
-from flask import current_app as app, request
+from flask import Blueprint
+from flask import current_app as app
+from flask import redirect, render_template, request, url_for
 from flask_babel import lazy_gettext as _
 from flask_login import current_user, login_required
-from functools import wraps
+
+from ..server_endpoints import flash
+from ..services import ExtensionException
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +21,7 @@ services_endpoint = Blueprint(
 # All blueprint from Services are no longer loaded statically but dynamically when the service-class in initialized
 # check cryptoadvance.specter.services.service_manager.Service for doing that and
 # check cryptoadvance.specter.services/**/manifest for instances of Service-classes and
-# check cryptoadvance.specter.services.service_manager.ServiceManager.services for initialisation of ServiceClasses
+# check cryptoadvance.specter.services.service_manager.ExtensionManager.services for initialisation of ServiceClasses
 
 
 def user_secret_decrypted_required(func):
@@ -73,7 +77,10 @@ def associate_addr(wallet_alias, address):
     # Inject the User's active Services
     services = []
     for service_id in current_user.services:
-        services.append(app.specter.service_manager.get_service(service_id=service_id))
+        try:
+            services.append(app.specter.service_manager.get_service(service_id))
+        except ExtensionException:
+            pass
 
     return render_template(
         "services/associate_addr.jinja",

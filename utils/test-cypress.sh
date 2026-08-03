@@ -20,15 +20,26 @@ fi
 
 function check_consistency {
   if ! npm version 2> /dev/null 1>&2 ; then
-    echo "npm is not on the PATH. Please install node and bring on the PATH"
+    echo "npm is not on the PATH. Please install node and bring it on the PATH."
     exit 1
   fi
-  if ps | grep python | grep -v grep ; then # the second grep might be necessary because MacOs has a non POSIX ps
-      echo "there is still a python-process running which is suspicious. Maybe wait a few more seconds"
-      sleep 5
-      ps | grep python && (echo "please investigate or kill " && exit 1)
+  if ! ps | grep python | grep -q -v grep; then
+    echo "There are no other Python processes running, good to go!"
+  else 
+    GREP_OUTPUT=$(ps | grep python | grep -v grep) 
+    SPECTER_STR="cryptoadvance.specter server"
+    while read -r line; do # https://unix.stackexchange.com/questions/9784/how-can-i-read-line-by-line-from-a-variable-in-bash
+      if [[ "$line" == *"$SPECTER_STR"* ]]; then 
+          echo "There is another Specter process running, this is fine."
+      else
+        echo "There is a suspicious Python process running. Maybe wait a few more seconds."
+        sleep 5
+        echo "Please investigate the following process and perhaps kill: $line"
+        exit 1
+      fi
+    done <<< "$GREP_OUTPUT"
   fi
-  $(npm bin)/cypress verify
+  npx cypress verify
 }
 
 check_consistency
@@ -52,7 +63,7 @@ Subcommands:
 
 generic-options:
     --debug             Run as much stuff in debug as we can
-    --docker            Run bitcoind in docker instead of directly
+    --with-elements     In addition to bitcoind, also start elementsd
 EOF
 }
 
@@ -99,11 +110,13 @@ function start_node {
       --bitcoin)
         node_impl=bitcoind
         node_impl_abbrev=btcd
+        node_port=15443
         shift
         ;;
       --elements)
         node_impl=elementsd
         node_impl_abbrev=elmd
+        node_port=8040
         shift
         ;;
       --reset)
@@ -143,13 +156,8 @@ function start_node {
       addopts="--log-stdout"
     fi
   fi
-  if [ "$DOCKER" != "true" ]; then
-    if [ "$node_impl" != "elementsd" ]; then # no docker for elementsd yet
-      addopts="$addopts --nodocker"
-    fi
-  fi
   echo "--> Starting $node_impl with $addopts ..."
-  python3 -m cryptoadvance.specter $DEBUG $node_impl $addopts --create-conn-json --config $SPECTER_CONFIG &
+  python3 -m cryptoadvance.specter $DEBUG $node_impl $addopts --no-mining --port $node_port --create-conn-json --config $SPECTER_CONFIG &
   if [ "$node_impl" = "bitcoind" ]; then
     bitcoind_pid=$!
   else
@@ -169,7 +177,9 @@ function start_bitcoind {
 }
 
 function start_elementsd {
-  start_node --elements $*
+  if [ $USE_ELEMENTSD = true ]; then
+    start_node --elements $*
+  fi
 }
 
 function stop_bitcoind {
@@ -201,7 +211,7 @@ function start_specter {
   # Simulate slower machines with uncommenting this (-l 10 means using 10% cpu):
   #cpulimit -p $specter_pid -l 10 -b
   echo "--> Waiting for specter ..."
-  $(npm bin)/wait-on http://127.0.0.1:${PORT} && echo "--> Success"
+  npx wait-on http://127.0.0.1:${PORT} && echo "--> Success"
   
 }
 
@@ -263,15 +273,15 @@ function restore_snapshot {
 
   rm -rf ${BTCD_REGTEST_DATA_DIR}
   mkdir ${BTCD_REGTEST_DATA_DIR}
-  echo "--> Unpacking ./cypress/fixtures/${spec_file}_btcdir.tar.gz ... "
+  echo "--> Unpacking ./cypress/fixtures/${spec_file}_btcdir.tar.gz ... into ${BTCD_REGTEST_DATA_DIR}"
   tar -xzf ./cypress/fixtures/${spec_file}_btcdir.tar.gz -C ${BTCD_REGTEST_DATA_DIR} --strip-components=1
 
   rm -rf ${ELMD_REGTEST_DATA_DIR}
   mkdir ${ELMD_REGTEST_DATA_DIR}
-  echo "--> Unpacking ./cypress/fixtures/${spec_file}_elmdir.tar.gz ... "
+  echo "--> Unpacking ./cypress/fixtures/${spec_file}_elmdir.tar.gz into ${ELMD_REGTEST_DATA_DIR} ..."
   tar -xzf ./cypress/fixtures/${spec_file}_elmdir.tar.gz -C ${ELMD_REGTEST_DATA_DIR} --strip-components=1
 
-  echo "--> Unpacking ./cypress/fixtures/${spec_file}_specterdir.tar.gz ... "
+  echo "--> Unpacking ./cypress/fixtures/${spec_file}_specterdir.tar.gz ... into ${SPECTER_DATA_FOLDER} ..."
   rm -rf $SPECTER_DATA_FOLDER
   mkdir $SPECTER_DATA_FOLDER 
   tar -xzf ./cypress/fixtures/${spec_file}_specterdir.tar.gz -C $SPECTER_DATA_FOLDER --strip-components=1
@@ -305,35 +315,42 @@ function sub_open {
   spec_file=$1
   if [ -n "${spec_file}" ]; then
     restore_snapshot ${spec_file}
-    start_bitcoind --cleanuphard --reset
-    start_elementsd --cleanuphard --reset
+    start_bitcoind
+    start_elementsd
     start_specter
   else
     start_bitcoind --reset
     start_elementsd --reset
     start_specter --reset
   fi
-  start_specter
-  $(npm bin)/cypress open
+  npx cypress open
 }
 
 function sub_run {
   spec_file=$1
   if [ -f ./cypress/integration/${spec_file} ]; then
     restore_snapshot ${spec_file}
-    start_bitcoind --cleanuphard --reset
-    start_elementsd --cleanuphard --reset
+    start_bitcoind 
+    start_elementsd
     start_specter
     # Run $spec_file and all of the others coming later!
-    #$(npm bin)/cypress run --spec $(./utils/calc_cypress_test_spec.py --run $spec_file)
+    #npx cypress run --spec $(./utils/calc_cypress_test_spec.py --run $spec_file)
     # Run $spec_file and only that spec-file!
-    $(npm bin)/cypress run --spec ./cypress/integration/${spec_file}
+    npx cypress run --spec ./cypress/integration/${spec_file}
   else 
     start_bitcoind --reset
     start_elementsd --reset
     start_specter --reset
-    $(npm bin)/cypress run
+    npx cypress run
   fi
+}
+
+function sub_basics {
+  start_bitcoind --reset
+  start_elementsd --reset
+  start_specter --reset
+  npx cypress run --spec $(./utils/cypress_basics.py) --config video=false
+  npx cypress open
 }
 
 function sub_snapshot {
@@ -347,7 +364,7 @@ function sub_snapshot {
   start_bitcoind --reset
   start_elementsd --reset
   start_specter --reset
-  $(npm bin)/cypress run --spec $(./utils/calc_cypress_test_spec.py $spec_file)
+  npx cypress run --spec $(./utils/calc_cypress_test_spec.py $spec_file)
   echo "--> stopping specter"
   stop_specter
   echo "--> stopping bitcoind gracefully ... won't take long ..."
@@ -382,6 +399,9 @@ function parse_and_execute() {
     exit 0
   fi 
 
+  # Don't start elementsd unless --with-elements is set
+  # Usage: ./utils/test-cypress.sh --with-elements run
+  USE_ELEMENTSD=false
   while [[ $# -gt 0 ]]
   do
   arg="$1"
@@ -399,8 +419,8 @@ function parse_and_execute() {
       ELMLOGSTDOUT=true
       shift
       ;;
-    --docker)
-      DOCKER=true
+    --with-elements)
+      USE_ELEMENTSD=true
       shift
       ;;
     *)

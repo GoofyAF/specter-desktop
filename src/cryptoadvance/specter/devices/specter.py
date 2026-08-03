@@ -1,5 +1,4 @@
 import hashlib
-from . import DeviceTypes
 from .sd_card_device import SDCardDevice
 from .hwi.specter_diy import enumerate as specter_enumerate, SpecterClient
 from ..helpers import to_ascii20
@@ -9,6 +8,7 @@ from embit.liquid.pset import PSET
 from embit.liquid.transaction import LSIGHASH
 from binascii import a2b_base64, b2a_base64
 from embit.liquid.networks import get_network
+from embit.hashes import hash160
 import logging
 
 logger = logging.getLogger(__name__)
@@ -59,15 +59,16 @@ def fill_external_wallet_derivations(psbt, wallet):
 
 
 class Specter(SDCardDevice):
-    device_type = DeviceTypes.SPECTERDIY
+    device_type = "specter"
     name = "Specter-DIY"
-    icon = "specter_icon.svg"
+    icon = "img/devices/specter_icon.svg"
 
     exportable_to_wallet = True
     sd_card_support = True
     qr_code_support = True
     qr_code_support_verify = True
     wallet_export_type = "qr"
+    supports_qr_message_signing = True
     supports_hwi_multisig_display_address = True
     liquid_support = True
     taproot_support = True
@@ -101,9 +102,7 @@ class Specter(SDCardDevice):
         base64_psbt = psbt.to_string()
         psbts = super().create_psbts(base64_psbt, wallet)
         # remove non-witness utxo if they are there to reduce QR code size
-        updated_psbt = wallet.fill_psbt(
-            base64_psbt, non_witness=False, xpubs=False, taproot_derivations=True
-        )
+        updated_psbt = wallet.fill_psbt(base64_psbt, non_witness=False, xpubs=False)
         try:
             qr_psbt = PSBT.from_string(updated_psbt)
         except:
@@ -139,12 +138,8 @@ class Specter(SDCardDevice):
         psbts["qrcode"] = qr_psbt.to_string()
 
         # we can add xpubs to SD card, but non_witness can be too large for MCU
-        psbts["sdcard"] = wallet.fill_psbt(
-            base64_psbt, non_witness=False, xpubs=True, taproot_derivations=True
-        )
-        psbts["hwi"] = wallet.fill_psbt(
-            base64_psbt, non_witness=False, xpubs=True, taproot_derivations=True
-        )
+        psbts["sdcard"] = wallet.fill_psbt(base64_psbt, non_witness=False, xpubs=True)
+        psbts["hwi"] = wallet.fill_psbt(base64_psbt, non_witness=False, xpubs=True)
         return psbts
 
     def export_wallet(self, wallet):
@@ -173,6 +168,5 @@ def get_wallet_fingerprint(wallet):
     Unique fingerprint of the wallet -
     first 4 bytes of hash160 of its descriptor
     """
-    h256 = hashlib.sha256(get_wallet_qr_descriptor(wallet).encode()).digest()
-    h160 = hashlib.new("ripemd160", h256).digest()
+    h160 = hash160(get_wallet_qr_descriptor(wallet).encode())
     return h160[:4]

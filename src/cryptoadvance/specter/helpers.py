@@ -16,6 +16,8 @@ from embit.psbt import PSBT
 from embit.transaction import Transaction
 from embit.liquid.pset import PSET
 from embit.liquid.transaction import LTransaction
+from embit.liquid.networks import NETWORKS
+from urllib.parse import unquote
 from .persistence import read_json_file, write_json_file
 from .util.bcur import bcur_decode
 import threading
@@ -64,7 +66,24 @@ def is_testnet(chain):
 
 
 def is_liquid(chain):
-    return chain not in ["main", "regtest", "test", "signet", "None", "none", None, ""]
+    return chain in ["liquidv1", "liquidtestnet", "elementsregtest", "elreg"]
+
+
+def normalize_address(addr: str) -> str:
+    """
+    Normalized address to canonical form.
+    Upper bech32 -> lower bech32, but doesn't touch base58 addresses.
+    """
+    # bitcoin hrps
+    hrps = {net["bech32"] + "1" for net in NETWORKS.values()}
+    # liquid hrps
+    # Blech32 addresses are intended for confidential assets
+    hrps = hrps.union(
+        {net["blech32"] + "1" for net in NETWORKS.values() if "blech32" in net}
+    )
+    if addr.lower().startswith(tuple(hrps)):
+        return addr.lower()
+    return addr
 
 
 def locked(customlock=defaultlock):
@@ -94,17 +113,33 @@ def to_ascii20(name: str) -> str:
     return "".join([c for c in name if ord(c) < 127])[:20]
 
 
-def alias(name):
+def create_unique_id(name):
     """
-    Create a filesystem-friendly alias from a string.
-    Replaces space with _ and keeps only alphanumeric chars.
+    Create a filesystem-friendly unique ID from a string.
+    Leading and trailing whitespaces are removed.
+    Replaces space(s) and hyphen(s) with one underscore.
+    Keeps only alphanumeric chars and returns in lowercase.
     """
-    name = name.replace(" ", "_")
+    name = name.strip().replace(" ", "_").replace("-", "_")
+    while "__" in name:
+        name = name.replace("__", "_")
     return "".join(x for x in name if x.isalnum() or x == "_").lower()
 
 
+def fullpath(data_folder, name):
+    """Quick way to get a fullpath which usually"""
+    return os.path.join(data_folder, f"{create_unique_id(name)}.json")
+
+
+def calc_fullpath(data_folder, name):
+    """Get a fullpath for a Businessobject with a name quickly"""
+    return os.path.join(data_folder, f"{create_unique_id(name)}.json")
+
+
 def deep_update(d, u):
-    """updates the dict d with the dict u"""
+    """updates the dict d with the dict u
+    in short: second argument wins
+    """
     for k, v in six.iteritems(u):
         dv = d.get(k, {})
         if not isinstance(dv, collections.abc.Mapping):
@@ -133,6 +168,9 @@ def load_jsons(folder, key=None):
                 d["alias"] = fname[:-5]
                 dd[d[key]] = d
         except Exception as e:
+            logger.error(
+                f"Exception while loading json file {os.path.join(folder, fname)}"
+            )
             logger.exception(e)
     return dd
 
@@ -143,7 +181,7 @@ def set_loglevel(app, loglevel_string):
         % loglevel_string
     )
     loglevels = {"WARN": logging.WARN, "INFO": logging.INFO, "DEBUG": logging.DEBUG}
-    logging.getLogger().setLevel(loglevels[loglevel_string])
+    logging.getLogger("cryptoadvance").setLevel(loglevels[loglevel_string])
     logger.warning("Loglevel-Test: This is a warn-message!")
     logger.info("Loglevel-Test: This is an info-message!")
     logger.debug("Loglevel-Test: This is an debug-message!")
@@ -264,42 +302,6 @@ def get_startblock_by_chain(specter):
     return startblock
 
 
-# Hot wallet helpers
-
-MNEMONIC_LANGUAGES = {
-    "en": "english",
-    "es": "spanish",
-    "fr": "french",
-    "it": "italian",
-    # "jp": "japanese",
-    # "ko": korean",
-    # "?": chinese_simplified",
-    # "?": chinese_traditional",
-}
-
-
-def initialize_mnemonic(language_code):
-    if language_code not in MNEMONIC_LANGUAGES:
-        # Fall back to English if Mnemonic doesn't support the current language
-        logger.debug(
-            f"Language code '{language_code}' not supported by python-mnemonic; using English"
-        )
-        language_code = "en"
-    return Mnemonic(language=MNEMONIC_LANGUAGES[language_code])
-
-
-def generate_mnemonic(strength=256, language_code="en"):
-    mnemo = initialize_mnemonic(language_code)
-    return mnemo.generate(strength=strength)
-
-
-def validate_mnemonic(words):
-    # We cannot assume the mnemonic will be in the same language currently active
-    #   in the UI (e.g. a Spanish user is likely to have an English mnemonic).
-    mnemo = initialize_mnemonic(Mnemonic.detect_language(words))
-    return mnemo.check(words)
-
-
 def notify_upgrade(app, flash):
     """If a new version is available, notifies the user via flash
     that there is an upgrade to specter.desktop
@@ -343,3 +345,25 @@ def get_address_from_dict(data_dict):
     if addr and addr != "Fee":
         return addr
     raise RuntimeError(f"Missing address info in object {data_dict}")
+
+
+def is_relative_url(url):
+    # Decode percent-encoded characters so encoded control/whitespace cannot
+    # bypass validation, e.g. /%09/baidu.com -> "/\t/baidu.com".
+    normalized = unquote(url)
+
+    if not normalized or not normalized.startswith("/"):
+        return False
+    # Reject protocol-relative URLs after decoding.
+    if normalized.startswith("//"):
+        return False
+    # Reject any decoded control characters or whitespace anywhere in the URL,
+    # including ASCII DEL (0x7f), since browsers may normalize them in unsafe
+    # ways.
+    if any(ord(c) < 32 or ord(c) == 127 or c.isspace() for c in normalized):
+        return False
+    # Reject backslashes to avoid alternate path separator confusion.
+    if "\\" in normalized:
+        return False
+
+    return True
